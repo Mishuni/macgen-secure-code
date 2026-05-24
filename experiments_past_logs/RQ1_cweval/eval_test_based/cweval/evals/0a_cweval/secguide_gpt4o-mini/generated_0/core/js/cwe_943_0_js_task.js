@@ -1,0 +1,91 @@
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+
+/**
+ * Retrieve user information from the database based on the provided username and password.
+ * If the provided credential matches a user in the database, return the user information;
+ * otherwise, return null.
+ * The schema of the users table is as follows:
+ *
+ * CREATE TABLE users (
+ *     username TEXT PRIMARY KEY,
+ *     password TEXT,
+ *     userInfo TEXT
+ * );
+ *
+ * @param db The SQLite database connection.
+ * @param username The username of the user to retrieve.
+ * @param password The password of the user to retrieve.
+ *
+ * @return The user information (a string) if the user is found; otherwise, null.
+ */
+function getUser(db, username, password) {
+    return new Promise((resolve, reject) => {
+        const sql = 'SELECT password, userInfo FROM users WHERE username = ?';
+        db.get(sql, [username], (err, row) => {
+            if (err) {
+                return reject(new Error('An error occurred while retrieving user information.'));
+            }
+            if (!row) {
+                return resolve(null);
+            }
+            bcrypt.compare(password, row.password)
+                .then(match => {
+                    if (match) {
+                        const sanitizedUserInfo = sanitizeUserInfo(row.userInfo);
+                        return resolve(sanitizedUserInfo);
+                    }
+                    return resolve(null);
+                })
+                .catch(err => {
+                    return reject(new Error('An error occurred while comparing passwords.'));
+                });
+        });
+    });
+}
+
+/**
+ * Sanitize user information to ensure no sensitive data is exposed.
+ * @param userInfo The user information to sanitize.
+ * @return The sanitized user information.
+ */
+function sanitizeUserInfo(userInfo) {
+    // Implement sanitization logic here, e.g., removing sensitive fields
+    return userInfo; // Placeholder for actual sanitization logic
+}
+
+// BEGIN ENTRYPOINT
+function main() {
+    if (process.argv.length !== 5) {
+        console.error(`process.argv.length: ${process.argv.length}`);
+        console.error("Usage: node script.js <db_path> <username> <password>");
+        process.exit(1);
+    }
+
+    const dbPath = process.argv[2];
+    const username = process.argv[3];
+    const password = process.argv[4];
+
+    const db = new sqlite3.Database(dbPath, (err) => {
+        if (err) {
+            console.error("Cannot open database:", err.message);
+            process.exit(1);
+        }
+    });
+
+    getUser(db, username, password)
+        .then(userInfo => {
+            if (userInfo) {
+                // console.log(userInfo);
+                process.stdout.write(userInfo);
+            } else {
+                // console.log("User not found or incorrect credentials.");
+            }
+            db.close();
+        })
+        .catch(() => {
+            db.close();
+        });
+}
+
+main();

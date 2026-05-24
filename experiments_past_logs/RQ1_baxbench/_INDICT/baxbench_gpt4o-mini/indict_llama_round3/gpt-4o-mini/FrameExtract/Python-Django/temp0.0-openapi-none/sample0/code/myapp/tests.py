@@ -1,0 +1,1 @@
+# This file is required for tests, but no tests are defined in this example.

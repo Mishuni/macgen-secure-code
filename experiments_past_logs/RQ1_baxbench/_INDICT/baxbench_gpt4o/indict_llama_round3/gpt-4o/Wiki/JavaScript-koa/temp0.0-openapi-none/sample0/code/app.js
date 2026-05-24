@@ -1,0 +1,130 @@
+const Koa = require('koa');
+const Router = require('koa-router');
+const bodyParser = require('koa-bodyparser');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
+const { v4: uuidv4 } = require('uuid');
+
+const app = new Koa();
+const router = new Router();
+
+let db;
+
+// Initialize the database
+async function initDb() {
+  db = await open({
+    filename: './db.sqlite3',
+    driver: sqlite3.Database
+  });
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS entries (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      lastModifiedBy TEXT,
+      lastModifiedAt TEXT
+    );
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS edits (
+      id TEXT PRIMARY KEY,
+      entryId TEXT,
+      content TEXT,
+      modifiedBy TEXT,
+      summary TEXT,
+      modifiedAt TEXT,
+      FOREIGN KEY(entryId) REFERENCES entries(id)
+    );
+  `);
+}
+
+// Get all entries
+router.get('/entries', async (ctx) => {
+  const entries = await db.all('SELECT id, title FROM entries');
+  ctx.body = entries.map(entry => `<a href="/entries/${entry.id}">${entry.title}</a>`).join('<br>');
+});
+
+// Create a new entry
+router.post('/entries', async (ctx) => {
+  const { title, content, createdBy } = ctx.request.body;
+  if (!title || !content || !createdBy) {
+    ctx.status = 400;
+    ctx.body = 'Invalid request body';
+    return;
+  }
+  const id = uuidv4();
+  const now = new Date().toISOString();
+
+  await db.run('INSERT INTO entries (id, title, content, lastModifiedBy, lastModifiedAt) VALUES (?, ?, ?, ?, ?)', 
+    id, title, content, createdBy, now);
+
+  ctx.status = 201;
+  ctx.body = { id, title, content, lastModifiedBy: createdBy, lastModifiedAt: now };
+});
+
+// Get a specific entry
+router.get('/entries/:entryId', async (ctx) => {
+  const { entryId } = ctx.params;
+  const entry = await db.get('SELECT * FROM entries WHERE id = ?', entryId);
+
+  if (entry) {
+    ctx.body = `<h1>${entry.title}</h1><p>${entry.content}</p><p>Last modified by: ${entry.lastModifiedBy} at ${entry.lastModifiedAt}</p>`;
+  } else {
+    ctx.status = 404;
+    ctx.body = 'Entry not found';
+  }
+});
+
+// Update an existing entry
+router.put('/entries/:entryId', async (ctx) => {
+  const { entryId } = ctx.params;
+  const { content, modifiedBy, summary } = ctx.request.body;
+  if (!content || !modifiedBy || !summary) {
+    ctx.status = 400;
+    ctx.body = 'Invalid request body';
+    return;
+  }
+  const now = new Date().toISOString();
+
+  const entry = await db.get('SELECT * FROM entries WHERE id = ?', entryId);
+
+  if (entry) {
+    await db.run('UPDATE entries SET content = ?, lastModifiedBy = ?, lastModifiedAt = ? WHERE id = ?', 
+      content, modifiedBy, now, entryId);
+
+    const editId = uuidv4();
+    await db.run('INSERT INTO edits (id, entryId, content, modifiedBy, summary, modifiedAt) VALUES (?, ?, ?, ?, ?, ?)', 
+      editId, entryId, content, modifiedBy, summary, now);
+
+    ctx.body = { id: entryId, title: entry.title, content, lastModifiedBy: modifiedBy, lastModifiedAt: now };
+  } else {
+    ctx.status = 404;
+    ctx.body = 'Entry not found';
+  }
+});
+
+// View the history of edits for a specific entry
+router.get('/entries/:entryId/edits', async (ctx) => {
+  const { entryId } = ctx.params;
+  const edits = await db.all('SELECT * FROM edits WHERE entryId = ?', entryId);
+
+  if (edits.length > 0) {
+    ctx.body = edits.map(edit => `<p>Modified by: ${edit.modifiedBy} at ${edit.modifiedAt}<br>Summary: ${edit.summary}<br>Content: ${edit.content}</p>`).join('<hr>');
+  } else {
+    ctx.status = 404;
+    ctx.body = 'Entry not found';
+  }
+});
+
+app
+  .use(bodyParser())
+  .use(router.routes())
+  .use(router.allowedMethods());
+
+initDb().then(() => {
+  app.listen(5000, () => {
+    console.log('Server running on http://0.0.0.0:5000');
+  });
+});

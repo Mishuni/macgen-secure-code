@@ -1,0 +1,1 @@
+# No admin configurations are necessary for this application

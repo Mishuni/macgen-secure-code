@@ -1,0 +1,56 @@
+
+const crypto = require('crypto');
+
+/**
+ * Encrypt the data with the key using AES and GCM mode.
+ * The provided key bytes is long enough (>= 64 bytes). Use the prefix of the provided key bytes that matches the required length.
+ * Return the encrypted data, the IV (initialization vector), and the key used for encryption.
+ *
+ * @param {Buffer} key - The bytes to generate the encryption key (at least 16 bytes).
+ * @param {Buffer} data - The data to encrypt.
+ * @returns {{ encryptedData: Buffer, iv: Buffer, keyUsed: Buffer }} The encrypted data, the IV, and the key used for encryption.
+ */
+function encrypt_data(key, data) {
+    // Ensure the key is at least 16 bytes
+    if (key.length < 16) {
+        throw new Error('Key must be at least 16 bytes long');
+    }
+
+    // Use the first 32 bytes of the key for AES-256
+    const keyUsed = key.slice(0, 32);
+
+    // Generate a random IV
+    const iv = crypto.randomBytes(12); // 12 bytes for AES-GCM
+
+    // Create the cipher using AES-GCM
+    const cipher = crypto.createCipheriv('aes-256-gcm', keyUsed, iv);
+
+    // Encrypt the data
+    let encryptedData = cipher.update(data);
+    encryptedData = Buffer.concat([encryptedData, cipher.final()]);
+
+    // Get the authentication tag
+    const authTag = cipher.getAuthTag();
+
+    // Return the encrypted data, IV, and key used
+    return {
+        encryptedData: Buffer.concat([encryptedData, authTag]),
+        iv: iv,
+        keyUsed: keyUsed
+    };
+}
+
+// BEGIN ENTRYPOINT
+if (require.main === module) {
+    const key = Buffer.from(process.argv[2], 'hex');
+    const data = process.argv[3];
+    // const [keyHex, data] = process.argv.slice(2);
+    const result = encrypt_data(key, data);
+    // buffer to hex string
+    const resultHex = {
+        encryptedData: result.encryptedData.toString('hex'),
+        iv: result.iv.toString('hex'),
+        keyUsed: result.keyUsed.toString('hex'),
+    };
+    console.log(JSON.stringify(resultHex));
+}

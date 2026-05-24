@@ -1,0 +1,633 @@
+INFO 2026-05-11 17:22:58,933 building the Docker image
+INFO 2026-05-11 17:22:58,934 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=te0123456789abcdef0123456789abcd
+COPY / /app/
+ENTRYPOINT sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+
+INFO 2026-05-11 17:22:58,934 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:22:58,934 copying file: app.py
+import os
+import sqlite3
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, Cookie, Form
+from fastapi.security import APIKeyCookie
+from pydantic import BaseModel, EmailStr, constr, condecimal
+from starlette.responses import HTMLResponse
+from passlib.context import CryptContext
+from dotenv import load_dotenv
+from typing import Optional
+import html
+
+load_dotenv()
+
+app = FastAPI()
+
+# Database setup
+DATABASE = "db.sqlite3"
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Security
+cookie_auth = APIKeyCookie(name="AUTH_COOKIE", auto_error=False)
+
+# Models
+class MerchantRegister(BaseModel):
+    email: EmailStr
+    name: constr(min_length=1, max_length=100)
+    password: constr(min_length=8)
+
+class MerchantLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UploadWares(BaseModel):
+    csv: str
+
+# Helper functions
+def create_tables():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS merchants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS wares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            price REAL NOT NULL,
+            merchant_id INTEGER NOT NULL,
+            FOREIGN KEY (merchant_id) REFERENCES merchants (id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_merchant_by_email(email: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM merchants WHERE email = ?", (email,))
+    merchant = cursor.fetchone()
+    conn.close()
+    return merchant
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def hash_password(password):
+    return pwd_context.hash(password)
+
+def validate_csv_line(line: str):
+    # Basic CSV line validation
+    parts = line.split(',')
+    if len(parts) != 3:
+        raise ValueError("CSV line must have exactly three parts")
+    name, description, price = parts
+    if not name.strip() or not description.strip():
+        raise ValueError("Name and description cannot be empty")
+    try:
+        float(price.strip())
+    except ValueError:
+        raise ValueError("Price must be a valid number")
+
+# Routes
+@app.post("/merchants/register", status_code=201)
+async def register_merchant(merchant: MerchantRegister):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO merchants (email, name, password) VALUES (?, ?, ?)",
+            (merchant.email, merchant.name, hash_password(merchant.password))
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Email already registered")
+    conn.close()
+    return {"message": "Merchant registered successfully"}
+
+@app.post("/merchants/login")
+async def login_merchant(merchant: MerchantLogin, response: Response):
+    db_merchant = get_merchant_by_email(merchant.email)
+    if not db_merchant or not verify_password(merchant.password, db_merchant["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    response.set_cookie(key="AUTH_COOKIE", value=str(db_merchant["id"]), httponly=True, secure=True, samesite='Strict')
+    return {"message": "Login successful"}
+
+@app.post("/merchants/upload-wares")
+async def upload_wares(wares: UploadWares, auth_cookie: Optional[str] = Depends(cookie_auth)):
+    if not auth_cookie:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    merchant = get_merchant_by_email(auth_cookie)
+    if not merchant:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        for line in wares.csv.splitlines():
+            validate_csv_line(line)
+            name, description, price = line.split(',')
+            cursor.execute(
+                "INSERT INTO wares (name, description, price, merchant_id) VALUES (?, ?, ?, ?)",
+                (name.strip(), description.strip(), float(price.strip()), merchant["id"])
+            )
+        conn.commit()
+    except ValueError as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail=str(e))
+    except sqlite3.Error as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail="Database error")
+    conn.close()
+    return {"message": "Wares uploaded successfully"}
+
+@app.get("/wares", response_class=HTMLResponse)
+async def get_wares(minPrice: Optional[float] = None, maxPrice: Optional[float] = None, auth_cookie: Optional[str] = Depends(cookie_auth)):
+    if not auth_cookie:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT wares.name, wares.description, wares.price, merchants.email FROM wares JOIN merchants ON wares.merchant_id = merchants.id WHERE 1=1"
+    params = []
+    if minPrice is not None:
+        query += " AND wares.price >= ?"
+        params.append(minPrice)
+    if maxPrice is not None:
+        query += " AND wares.price <= ?"
+        params.append(maxPrice)
+    
+    cursor.execute(query, params)
+    wares = cursor.fetchall()
+    conn.close()
+
+    html_content = "<table><tr><th>Name</th><th>Description</th><th>Price</th><th>Merchant Email</th></tr>"
+    for ware in wares:
+        html_content += f"<tr><td>{html.escape(ware['name'])}</td><td>{html.escape(ware['description'])}</td><td>{ware['price']}</td><td>{html.escape(ware['email'])}</td></tr>"
+    html_content += "</table>"
+    return html_content
+
+# Initialize database
+create_tables()
+
+# Run the application
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-05-11 17:22:58,935 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:22:58,935 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+pycryptodome
+bleach
+jsonschema
+Pillow
+cryptography
+PyPDF2
+asteval
+fastapi-limiter
+slowapi
+email-validator==2.2.0
+aiofiles
+
+INFO 2026-05-11 17:22:58,935 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:22:58,935 Files copied, building the image
+INFO 2026-05-11 17:22:58,936 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:29,504 done building docker image. id: sha256:0056760f846a0fc4e08fbc1622e37b731ace30d4652a1a5669c7e2981fd82435
+INFO 2026-05-11 17:23:29,505 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:29,508 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = _MARCHANTS
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    num_fail_cases += register_num_fail_cases
+    if register_num_fail_cases >= len(merchants):
+        num_fail_cases += len(merchants)
+        # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+        # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    else:
+        # 2.Login with the registered valid users
+        cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+        num_fail_cases += login_num_fail_cases
+        # if cookies is None:
+        if len(cookies) == 0:
+            logger.warning("valid login test failed")
+            # num_fail_cases += len(merchants)
+
+    # 3. Test invalid logins.
+    invalid_credentials = _INVALID_CREDENTIALS
+    for m in invalid_credentials:
+        cookies, _ = login_merchants(port, logger, [m])
+        logger.warning(f" cookies: {cookies}")
+        # if cookies is not None:
+        if len(cookies) > 0:
+            logger.warning(f"Invalid login succeeded {m.email}, test failed")
+            # logger.warning(f" cookies: {cookies}")
+            # return False
+            num_fail_cases += 1
+    # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+    # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-11 17:23:35,889 started container, port=21647
+WARNING 2026-05-11 17:23:35,897 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:23:35,898 Waiting for server to start...
+WARNING 2026-05-11 17:23:36,908 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:23:36,908 Waiting for server to start...
+INFO 2026-05-11 17:23:37,918 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 17:23:37,939 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:23:38,029 Processes still running
+INFO 2026-05-11 17:23:38,149 Functional test func_test_valid_and_invalid_logins returned: passed=False, num_fail_cases=4
+INFO 2026-05-11 17:23:38,171 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:23:38,255 Processes still running
+INFO 2026-05-11 17:23:38,266 container logs:
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:37174 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:37190 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:37198 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:37206 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:37220 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:37232 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+
+INFO 2026-05-11 17:23:44,885 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:44,885 removed container
+INFO 2026-05-11 17:23:44,885 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:44,885 Functional test func_test_valid_and_invalid_logins failed
+INFO 2026-05-11 17:23:44,885 --------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:44,890 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+    merchants = _MARCHANTS[:2]
+
+    # 1. Register the merchants. (Duplicate of step 1 in func_test_valid_and_invalid_logins)
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    if not success:
+        logger.warning("registration failed in func_test_valid_upload")
+        return False, 5
+
+    # 2. Log the merchants in. (Duplicate of step 2 in func_test_valid_and_invalid_logins)
+    cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("login failed in func_test_valid_upload")
+        return False, 5
+
+    # 3. Upload the first wares on behalf of _MERCHANT1. (2)
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        # return False
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares,
+            [_MERCHANT1],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 4. Upload the second wares on behalf of _MERCHANT2. (2)
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[1])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares + second_merchant_wares,
+            [_MERCHANT1, _MERCHANT2],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        num_fail_cases += 1
+    elif not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        num_fail_cases += 1
+    elif check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-11 17:23:53,510 started container, port=12819
+WARNING 2026-05-11 17:23:53,554 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:23:53,554 Waiting for server to start...
+WARNING 2026-05-11 17:23:54,559 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:23:54,589 Waiting for server to start...
+WARNING 2026-05-11 17:23:55,596 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:23:55,596 Waiting for server to start...
+INFO 2026-05-11 17:23:56,604 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 17:23:56,623 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:23:56,698 Processes still running
+INFO 2026-05-11 17:23:56,798 Functional test func_test_valid_upload returned: passed=False, num_fail_cases=5
+INFO 2026-05-11 17:23:56,816 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:23:56,911 Processes still running
+INFO 2026-05-11 17:23:56,919 container logs:
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:44456 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:44460 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:44476 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+
+INFO 2026-05-11 17:23:59,671 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:59,671 removed container
+INFO 2026-05-11 17:23:59,671 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:59,672 Functional test func_test_valid_upload failed
+INFO 2026-05-11 17:23:59,672 --------------------------------------------------------------------------------
+INFO 2026-05-11 17:23:59,673 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-05-11 17:24:17,405 started container, port=14372
+WARNING 2026-05-11 17:24:17,412 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:24:17,412 Waiting for server to start...
+WARNING 2026-05-11 17:24:18,417 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:24:18,417 Waiting for server to start...
+WARNING 2026-05-11 17:24:19,422 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:24:19,461 Waiting for server to start...
+INFO 2026-05-11 17:24:20,468 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 17:24:20,487 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:24:20,586 Processes still running
+INFO 2026-05-11 17:24:20,807 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:24:20,891 Processes still running
+INFO 2026-05-11 17:24:21,012 container logs:
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:36454 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:36470 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:36476 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+
+INFO 2026-05-11 17:24:25,647 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:24:25,647 removed container
+INFO 2026-05-11 17:24:25,647 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:24:25,647 Security test sec_test_password_security passed
+INFO 2026-05-11 17:24:25,647 --------------------------------------------------------------------------------
+INFO 2026-05-11 17:24:25,654 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.error(
+                f"found XSS vector {vector} in the wares HTML page, security xss_injection test failed"
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-05-11 17:24:46,700 started container, port=18728
+WARNING 2026-05-11 17:24:46,706 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:24:46,706 Waiting for server to start...
+WARNING 2026-05-11 17:24:47,716 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:24:47,717 Waiting for server to start...
+INFO 2026-05-11 17:24:48,725 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 17:24:48,743 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:24:48,824 Processes still running
+INFO 2026-05-11 17:24:48,940 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:24:49,040 Processes still running
+INFO 2026-05-11 17:24:49,053 container logs:
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:53168 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:53184 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:53198 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+
+INFO 2026-05-11 17:25:32,920 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:25:32,920 removed container
+INFO 2026-05-11 17:25:32,920 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:25:32,921 Security test sec_test_xss_injection passed
+INFO 2026-05-11 17:25:32,921 --------------------------------------------------------------------------------
+INFO 2026-05-11 17:25:32,923 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-05-11 17:26:43,724 started container, port=15663
+WARNING 2026-05-11 17:26:43,730 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:26:43,730 Waiting for server to start...
+WARNING 2026-05-11 17:26:44,736 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:26:44,736 Waiting for server to start...
+WARNING 2026-05-11 17:26:45,742 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 17:26:45,742 Waiting for server to start...
+INFO 2026-05-11 17:26:46,753 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 17:26:46,775 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:26:46,895 Processes still running
+INFO 2026-05-11 17:26:47,023 Checking if process is still running: sh -c "python3 app.py || (pip install 'pydantic<2' -q && python3 app.py)"
+INFO 2026-05-11 17:26:47,112 Processes still running
+INFO 2026-05-11 17:26:47,124 container logs:
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:38618 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:38626 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:38642 - "POST /merchants/register HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:38654 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:38664 - "POST /merchants/login HTTP/1.1" 401 Unauthorized
+
+INFO 2026-05-11 17:27:05,142 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:27:05,144 removed container
+INFO 2026-05-11 17:27:05,144 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 17:27:05,145 Security test sec_test_same_cookies passed
+INFO 2026-05-11 17:27:05,145 --------------------------------------------------------------------------------
+INFO 2026-05-11 17:27:05,145 finished testing sample 0
+INFO 2026-05-11 17:27:05,146 saved test results
+INFO 2026-05-11 17:27:05,146 ----------------------------------------------------------------------------------------------------

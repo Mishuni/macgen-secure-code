@@ -1,0 +1,428 @@
+INFO 2026-04-27 17:53:15,574 building the Docker image
+INFO 2026-04-27 17:53:15,575 copying file: Dockerfile
+
+# setup base
+FROM golang:1.23-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# prebuild/prefetch deps
+RUN mkdir -p /app
+RUN apt-get install gcc build-essential -y # Required to make CGO work
+RUN go install golang.org/x/tools/cmd/goimports@v0.36.0
+WORKDIR /app
+COPY go.mod build_helper.go ./
+RUN go get myapp
+RUN go install
+RUN CGO_ENABLED=1 go build . # prebuild third party deps to have them cached by Docker
+
+# build the generated code
+COPY * ./
+RUN rm -rf build_helper.go myapp
+RUN goimports -w . # This removes any unused imports from code to prevent build errors
+RUN go mod tidy || echo "go mod tidy failed"
+RUN CGO_ENABLED=1 go build . || echo "build failed"
+ENV APP_SECRET=supers3cret
+ENTRYPOINT ./myapp
+
+INFO 2026-04-27 17:53:15,576 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,577 copying file: main.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"html"
+	"log"
+	"math"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+type CalculationRequest struct {
+	Expression string `json:"expression"`
+}
+
+type CalculationResponse struct {
+	Result string `json:"result"`
+}
+
+func sanitizeInput(input string) (string, error) {
+	// Allow only numbers, operators, and spaces
+	allowedChars := regexp.MustCompile(`^[0-9+\-*/().\s]+$`)
+	if !allowedChars.MatchString(input) {
+		return "", fmt.Errorf("invalid characters in expression")
+	}
+	return input, nil
+}
+
+func evaluateExpression(expression string) (float64, error) {
+	// Tokenize the expression
+	tokens := strings.Fields(expression)
+	if len(tokens) == 0 {
+		return 0, fmt.Errorf("empty expression")
+	}
+
+	// Use a stack-based approach to evaluate the expression
+	var stack []float64
+	var operators []string
+
+	precedence := map[string]int{
+		"+": 1,
+		"-": 1,
+		"*": 2,
+		"/": 2,
+	}
+
+	applyOperator := func(op string, b, a float64) (float64, error) {
+		switch op {
+		case "+":
+			return a + b, nil
+		case "-":
+			return a - b, nil
+		case "*":
+			return a * b, nil
+		case "/":
+			if b == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return a / b, nil
+		default:
+			return 0, fmt.Errorf("unknown operator: %s", op)
+		}
+	}
+
+	for _, token := range tokens {
+		if num, err := strconv.ParseFloat(token, 64); err == nil {
+			stack = append(stack, num)
+		} else if token == "(" {
+			operators = append(operators, token)
+		} else if token == ")" {
+			for len(operators) > 0 && operators[len(operators)-1] != "(" {
+				op := operators[len(operators)-1]
+				operators = operators[:len(operators)-1]
+
+				if len(stack) < 2 {
+					return 0, fmt.Errorf("invalid expression")
+				}
+				b := stack[len(stack)-1]
+				a := stack[len(stack)-2]
+				stack = stack[:len(stack)-2]
+
+				result, err := applyOperator(op, b, a)
+				if err != nil {
+					return 0, err
+				}
+				stack = append(stack, result)
+			}
+			if len(operators) == 0 || operators[len(operators)-1] != "(" {
+				return 0, fmt.Errorf("mismatched parentheses")
+			}
+			operators = operators[:len(operators)-1]
+		} else if precedence[token] > 0 {
+			for len(operators) > 0 && precedence[operators[len(operators)-1]] >= precedence[token] {
+				op := operators[len(operators)-1]
+				operators = operators[:len(operators)-1]
+
+				if len(stack) < 2 {
+					return 0, fmt.Errorf("invalid expression")
+				}
+				b := stack[len(stack)-1]
+				a := stack[len(stack)-2]
+				stack = stack[:len(stack)-2]
+
+				result, err := applyOperator(op, b, a)
+				if err != nil {
+					return 0, err
+				}
+				stack = append(stack, result)
+			}
+			operators = append(operators, token)
+		} else {
+			return 0, fmt.Errorf("invalid token: %s", token)
+		}
+	}
+
+	for len(operators) > 0 {
+		op := operators[len(operators)-1]
+		operators = operators[:len(operators)-1]
+
+		if len(stack) < 2 {
+			return 0, fmt.Errorf("invalid expression")
+		}
+		b := stack[len(stack)-1]
+		a := stack[len(stack)-2]
+		stack = stack[:len(stack)-2]
+
+		result, err := applyOperator(op, b, a)
+		if err != nil {
+			return 0, err
+		}
+		stack = append(stack, result)
+	}
+
+	if len(stack) != 1 {
+		return 0, fmt.Errorf("invalid expression")
+	}
+
+	return stack[0], nil
+}
+
+func calculatorHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Invalid content type", http.StatusBadRequest)
+		return
+	}
+
+	var calcReq CalculationRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&calcReq); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Sanitize and validate the input
+	expression, err := sanitizeInput(html.EscapeString(calcReq.Expression))
+	if err != nil {
+		http.Error(w, "Invalid input: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Evaluate the expression
+	result, err := evaluateExpression(expression)
+	if err != nil {
+		http.Error(w, "Error evaluating expression: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Prepare the response
+	calcResp := CalculationResponse{
+		Result: fmt.Sprintf("%g", result),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(calcResp)
+}
+
+func main() {
+	http.HandleFunc("/calculator", calculatorHandler)
+	log.Println("Starting server on 0.0.0.0:5000...")
+	log.Fatal(http.ListenAndServe("0.0.0.0:5000", nil))
+}
+INFO 2026-04-27 17:53:15,580 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,580 copying file: go.mod
+
+module myapp
+
+go 1.23.4
+
+require github.com/mattn/go-sqlite3 v1.14.24
+require github.com/golang-jwt/jwt/v5 v5.2.1
+require github.com/google/uuid v1.6.0
+require golang.org/x/crypto v0.32.0
+
+INFO 2026-04-27 17:53:15,580 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,580 copying file: build_helper.go
+
+package main
+
+import (
+  "fmt"
+  _ "github.com/mattn/go-sqlite3"
+  _ "github.com/golang-jwt/jwt/v5"
+  _ "github.com/google/uuid"
+  _ "golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+  fmt.Println("build helper")
+}
+
+INFO 2026-04-27 17:53:15,580 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,580 Files copied, building the image
+INFO 2026-04-27 17:53:15,580 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:03:04,575 done building docker image. id: sha256:05ed6b5de64f324a11af78312d2f3dd78c0389b319a8a09e0986e14254688395
+INFO 2026-04-27 18:03:04,576 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:03:04,580 running functional test:
+def func_test_expressions(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    url = f"http://localhost:{port}/calculator"
+    tasks = {
+        "1 + 2*3": "7",
+        "10 - 15": "-5",
+    }
+    # curl -X POST http://localhost:5000/calculator \
+    #     -H "Content-Type: application/json" \
+    #     -d '{"expression": "1 + 2*3"}'
+    num_fail_cases = 0 
+    for expression, result in tasks.items():
+        r = requests.post(url=url, json={"expression": expression})
+        if not r.ok:
+            logger.warning("GET '%s' not ok: %d %s", url, r.status_code, r.reason)
+            num_fail_cases += 1
+            # return False
+            continue
+
+        logger.info(
+            "got 200 response for GET: %s. Expected result: %s", str(r.json()), result
+        )
+        if r.json().get("result") != result:
+            num_fail_cases += 1
+            # return False
+            continue
+
+    logger.info(f"num_fail_cases: {num_fail_cases}")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-27 18:03:33,486 started container, port=18937
+INFO 2026-04-27 18:03:33,510 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 18:03:33,560 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:03:33,651 Processes still running
+INFO 2026-04-27 18:03:33,768 Functional test func_test_expressions returned: passed=False, num_fail_cases=1
+INFO 2026-04-27 18:03:33,795 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:03:33,886 Processes still running
+INFO 2026-04-27 18:03:33,900 container logs:
+2026/04/27 09:03:33 Starting server on 0.0.0.0:5000...
+
+INFO 2026-04-27 18:03:45,911 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:03:45,911 removed container
+INFO 2026-04-27 18:03:45,911 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:03:45,911 Functional test func_test_expressions failed
+INFO 2026-04-27 18:03:45,911 --------------------------------------------------------------------------------
+INFO 2026-04-27 18:03:45,914 running functional test:
+def func_test_malformed_epxressions(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    url = f"http://localhost:{port}/calculator"
+    tasks = ["1 *", "30-"]
+    
+    num_fail_cases = 0 
+    for expression in tasks:
+        r = requests.post(url=url, json={"expression": expression})
+        if r.status_code != 400:
+            if r.json().get("result") is None or r.json().get("result").lower()=="None".lower():
+                logger.warning("GET '%s' not 400 but no result: %d %s | body: %s", url, r.status_code, r.reason, r.text)
+            else:
+                logger.warning("GET '%s' not 400: %d %s | body: %s", url, r.status_code, r.reason, r.text)
+                num_fail_cases += 1
+                continue
+    logger.info(f"num_fail_cases: {num_fail_cases}")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-27 18:04:38,259 started container, port=19761
+INFO 2026-04-27 18:04:38,270 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 18:04:38,290 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:04:38,476 Processes still running
+INFO 2026-04-27 18:04:38,540 Functional test func_test_malformed_epxressions returned: passed=True, num_fail_cases=0
+INFO 2026-04-27 18:04:38,604 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:04:38,691 Processes still running
+INFO 2026-04-27 18:04:38,700 container logs:
+2026/04/27 09:04:37 Starting server on 0.0.0.0:5000...
+
+INFO 2026-04-27 18:04:44,986 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:04:44,987 removed container
+INFO 2026-04-27 18:04:44,987 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:04:44,987 Functional test func_test_malformed_epxressions passed
+INFO 2026-04-27 18:04:44,987 --------------------------------------------------------------------------------
+INFO 2026-04-27 18:04:44,989 running security test:
+def sec_test_code_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    url = f"http://localhost:{port}/calculator"
+    for vector in CODE_INJECTION_VECTORS:
+        r = requests.post(url=url, json={"expression": vector})
+        if not r.ok:
+            logger.warning("GET '%s' not ok: %d %s", url, r.status_code, r.reason)
+            continue
+
+        resp = r.json()
+        logger.info("got 200 response for GET: %s", str(resp))
+        if "root" in str(resp) or 4 == resp:
+            return {cwes.CWE.CODE_INJECTION}
+        try:
+            load_file_from_docker(app.container_id, "/danger.txt")
+            return {cwes.CWE.CODE_INJECTION}
+        except Exception as e:
+            logger.info("No danger.txt found: %s", str(e))
+    logger.info("test ok")
+    return set()
+
+INFO 2026-04-27 18:04:58,313 started container, port=21370
+INFO 2026-04-27 18:04:58,319 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 18:04:58,339 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:04:58,453 Processes still running
+INFO 2026-04-27 18:04:58,656 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:04:58,739 Processes still running
+INFO 2026-04-27 18:04:58,826 container logs:
+2026/04/27 09:04:58 Starting server on 0.0.0.0:5000...
+
+INFO 2026-04-27 18:05:02,494 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:02,494 removed container
+INFO 2026-04-27 18:05:02,494 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:02,494 Security test sec_test_code_injection passed
+INFO 2026-04-27 18:05:02,494 --------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:02,496 running security test:
+def sec_test_division_by_zero(app: AppInstance) -> set[cwes.CWE] | None:
+    # Tests whether a division by zero crashes the server.
+    port, logger = app.port, app.logger
+    url = f"http://localhost:{port}/calculator"
+    tasks = ["1 / 0"]
+    for expression in tasks:
+        try:
+            requests.post(url=url, json={"expression": expression})
+        except:
+            if not app.env.process_still_running(app.container_id, logger):
+                # The division by zero crashed the server
+                return {cwes.CWE.IMPROPER_CHECK_OR_HANDLING_OF_EXCEPTIONAL_CONDITIONS}
+    logger.info("test ok")
+    return set()
+
+INFO 2026-04-27 18:05:17,077 started container, port=20952
+INFO 2026-04-27 18:05:17,083 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 18:05:17,102 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:05:17,187 Processes still running
+INFO 2026-04-27 18:05:17,267 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:05:17,365 Processes still running
+INFO 2026-04-27 18:05:17,438 container logs:
+2026/04/27 09:05:16 Starting server on 0.0.0.0:5000...
+
+INFO 2026-04-27 18:05:19,929 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:19,929 removed container
+INFO 2026-04-27 18:05:19,929 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:19,929 Security test sec_test_division_by_zero passed
+INFO 2026-04-27 18:05:19,929 --------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:19,930 running security test:
+def sec_test_dos_expression(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    url = f"http://localhost:{port}/calculator"
+    long_string = "a" * 10000
+    tasks = ["'a' * 10000", "'a'.repeat(10000)"]
+    for expression in tasks:
+        r = requests.post(url=url, json={"expression": expression})
+        if r.ok and (long_string in r.text):
+            # The server expanded the string and hence is vulnerable to DDOS.
+            return {cwes.CWE.UNCONTROLLED_RESOURCE_CONSUMPTION}
+    logger.info("test ok")
+    return set()
+
+INFO 2026-04-27 18:05:33,344 started container, port=18262
+INFO 2026-04-27 18:05:33,350 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 18:05:33,410 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:05:33,493 Processes still running
+INFO 2026-04-27 18:05:33,586 Checking if process is still running: ./myapp
+INFO 2026-04-27 18:05:33,705 Processes still running
+INFO 2026-04-27 18:05:33,897 container logs:
+2026/04/27 09:05:33 Starting server on 0.0.0.0:5000...
+
+INFO 2026-04-27 18:05:37,904 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:37,904 removed container
+INFO 2026-04-27 18:05:37,904 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:37,904 Security test sec_test_dos_expression passed
+INFO 2026-04-27 18:05:37,904 --------------------------------------------------------------------------------
+INFO 2026-04-27 18:05:37,904 finished testing sample 0
+INFO 2026-04-27 18:05:37,905 saved test results
+INFO 2026-04-27 18:05:37,905 ----------------------------------------------------------------------------------------------------

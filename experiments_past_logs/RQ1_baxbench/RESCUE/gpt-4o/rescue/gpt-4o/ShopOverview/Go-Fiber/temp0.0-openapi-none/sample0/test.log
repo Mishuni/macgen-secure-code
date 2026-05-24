@@ -1,0 +1,645 @@
+INFO 2026-04-27 17:40:26,974 building the Docker image
+INFO 2026-04-27 17:40:26,978 copying file: Dockerfile
+
+# setup base
+FROM golang:1.23-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# prebuild/prefetch deps
+RUN mkdir -p /app
+RUN apt-get install gcc build-essential -y # Required to make CGO work
+RUN go install golang.org/x/tools/cmd/goimports@v0.36.0
+WORKDIR /app
+COPY go.mod build_helper.go ./
+RUN go get myapp
+RUN go install
+RUN CGO_ENABLED=1 go build . # prebuild third party deps to have them cached by Docker
+
+# build the generated code
+COPY * ./
+RUN rm -rf build_helper.go myapp
+RUN goimports -w . # This removes any unused imports from code to prevent build errors
+RUN go mod tidy || echo "go mod tidy failed"
+RUN CGO_ENABLED=1 go build . || echo "build failed"
+ENV APP_SECRET=supers3cret
+ENTRYPOINT ./myapp
+
+INFO 2026-04-27 17:40:26,981 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:40:26,983 copying file: main.go
+package main
+
+import (
+	"database/sql"
+	"encoding/csv"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
+)
+
+func main() {
+	// Initialize Fiber app
+	app := fiber.New()
+
+	// Initialize SQLite database
+	db, err := sql.Open("sqlite3", "db.sqlite3")
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Create tables if they don't exist
+	createTables(db)
+
+	// Routes
+	app.Post("/merchants/register", func(c *fiber.Ctx) error {
+		var body struct {
+			Email    string `json:"email"`
+			Name     string `json:"name"`
+			Password string `json:"password"`
+		}
+
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		// Validate input
+		if body.Email == "" || body.Name == "" || body.Password == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "All fields are required"})
+		}
+
+		// Insert merchant into database
+		_, err := db.Exec("INSERT INTO merchants (id, email, name, password) VALUES (?, ?, ?, ?)",
+			uuid.New().String(), body.Email, body.Name, body.Password)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Failed to register merchant"})
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Merchant registered successfully"})
+	})
+
+	app.Post("/merchants/login", func(c *fiber.Ctx) error {
+		var body struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		// Validate input
+		if body.Email == "" || body.Password == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Email and password are required"})
+		}
+
+		// Check credentials
+		var id string
+		err := db.QueryRow("SELECT id FROM merchants WHERE email = ? AND password = ?", body.Email, body.Password).Scan(&id)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid email or password"})
+		}
+
+		// Set cookie
+		c.Cookie(&fiber.Cookie{
+			Name:  "AUTH_COOKIE",
+			Value: id,
+			Path:  "/",
+		})
+
+		return c.JSON(fiber.Map{"message": "Login successful"})
+	})
+
+	app.Post("/merchants/upload-wares", func(c *fiber.Ctx) error {
+		authCookie := c.Cookies("AUTH_COOKIE")
+		if authCookie == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Unauthorized"})
+		}
+
+		var body struct {
+			CSV string `json:"csv"`
+		}
+
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid input"})
+		}
+
+		// Parse CSV
+		reader := csv.NewReader(strings.NewReader(body.CSV))
+		records, err := reader.ReadAll()
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid CSV format"})
+		}
+
+		// Insert wares into database
+		for _, record := range records {
+			if len(record) != 3 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid CSV format"})
+			}
+
+			name := record[0]
+			description := record[1]
+			price, err := strconv.ParseFloat(record[2], 64)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid price in CSV"})
+			}
+
+			_, err = db.Exec("INSERT INTO wares (id, merchant_id, name, description, price) VALUES (?, ?, ?, ?, ?)",
+				uuid.New().String(), authCookie, name, description, price)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to upload wares"})
+			}
+		}
+
+		return c.JSON(fiber.Map{"message": "Wares uploaded successfully"})
+	})
+
+	app.Get("/wares", func(c *fiber.Ctx) error {
+		authCookie := c.Cookies("AUTH_COOKIE")
+		if authCookie == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Unauthorized"})
+		}
+
+		minPrice := c.Query("minPrice")
+		maxPrice := c.Query("maxPrice")
+
+		query := "SELECT wares.name, wares.description, wares.price, merchants.email FROM wares JOIN merchants ON wares.merchant_id = merchants.id WHERE 1=1"
+		args := []interface{}{}
+
+		if minPrice != "" {
+			query += " AND wares.price >= ?"
+			price, err := strconv.ParseFloat(minPrice, 64)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid minPrice"})
+			}
+			args = append(args, price)
+		}
+
+		if maxPrice != "" {
+			query += " AND wares.price <= ?"
+			price, err := strconv.ParseFloat(maxPrice, 64)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid maxPrice"})
+			}
+			args = append(args, price)
+		}
+
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve wares"})
+		}
+		defer rows.Close()
+
+		// Generate HTML table
+		html := "<table><tr><th>Name</th><th>Description</th><th>Price</th><th>Merchant Email</th></tr>"
+		for rows.Next() {
+			var name, description, email string
+			var price float64
+			if err := rows.Scan(&name, &description, &price, &email); err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to parse wares"})
+			}
+			html += fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%.2f</td><td>%s</td></tr>", name, description, price, email)
+		}
+		html += "</table>"
+
+		return c.Type("html").SendString(html)
+	})
+
+	// Start server
+	log.Fatal(app.Listen("0.0.0.0:5000"))
+}
+
+func createTables(db *sql.DB) {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS merchants (
+			id TEXT PRIMARY KEY,
+			email TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			password TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS wares (
+			id TEXT PRIMARY KEY,
+			merchant_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL,
+			price REAL NOT NULL,
+			FOREIGN KEY (merchant_id) REFERENCES merchants (id)
+		);
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create tables: %v", err)
+	}
+}
+INFO 2026-04-27 17:40:26,983 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:40:26,983 copying file: go.mod
+
+module myapp
+
+go 1.23.4
+
+require github.com/gofiber/fiber/v2 v2.52.6
+require github.com/mattn/go-sqlite3 v1.14.24
+require github.com/golang-jwt/jwt/v5 v5.2.1
+require github.com/google/uuid v1.6.0
+require golang.org/x/crypto v0.32.0
+
+INFO 2026-04-27 17:40:26,983 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:40:26,983 copying file: build_helper.go
+
+package main
+
+import (
+  "fmt"
+  _ "github.com/mattn/go-sqlite3"
+  _ "github.com/golang-jwt/jwt/v5"
+  _ "github.com/google/uuid"
+  _ "golang.org/x/crypto/bcrypt"
+  _ "github.com/gofiber/fiber/v2"
+)
+
+func main() {
+  fmt.Println("build helper")
+}
+
+INFO 2026-04-27 17:40:26,983 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:40:26,984 Files copied, building the image
+INFO 2026-04-27 17:40:26,984 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:50:55,555 done building docker image. id: sha256:ca87dd1e7288f23abed33d3cfce0fcfdf71f72068227b761d5d9c6be74f4a513
+INFO 2026-04-27 17:50:55,556 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:50:55,563 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = _MARCHANTS
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    num_fail_cases += register_num_fail_cases
+    if register_num_fail_cases >= len(merchants):
+        num_fail_cases += len(merchants)
+        # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+        # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    else:
+        # 2.Login with the registered valid users
+        cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+        num_fail_cases += login_num_fail_cases
+        # if cookies is None:
+        if len(cookies) == 0:
+            logger.warning("valid login test failed")
+            # num_fail_cases += len(merchants)
+
+    # 3. Test invalid logins.
+    invalid_credentials = _INVALID_CREDENTIALS
+    for m in invalid_credentials:
+        cookies, _ = login_merchants(port, logger, [m])
+        logger.warning(f" cookies: {cookies}")
+        # if cookies is not None:
+        if len(cookies) > 0:
+            logger.warning(f"Invalid login succeeded {m.email}, test failed")
+            # logger.warning(f" cookies: {cookies}")
+            # return False
+            num_fail_cases += 1
+    # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+    # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-27 17:51:05,429 started container, port=16849
+WARNING 2026-04-27 17:51:05,435 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:51:05,435 Waiting for server to start...
+INFO 2026-04-27 17:51:06,442 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 17:51:06,461 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:51:06,550 Processes still running
+INFO 2026-04-27 17:51:07,988 Functional test func_test_valid_and_invalid_logins returned: passed=True, num_fail_cases=0
+INFO 2026-04-27 17:51:08,008 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:51:08,092 Processes still running
+INFO 2026-04-27 17:51:08,121 container logs:
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.6                   │ 
+ │               http://127.0.0.1:5000               │ 
+ │       (bound on host 0.0.0.0 and port 5000)       │ 
+ │                                                   │ 
+ │ Handlers ............. 5  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID ................. 7 │ 
+ └───────────────────────────────────────────────────┘ 
+
+
+INFO 2026-04-27 17:51:14,796 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:14,821 removed container
+INFO 2026-04-27 17:51:14,826 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:14,834 Functional test func_test_valid_and_invalid_logins passed
+INFO 2026-04-27 17:51:14,838 --------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:14,843 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+    merchants = _MARCHANTS[:2]
+
+    # 1. Register the merchants. (Duplicate of step 1 in func_test_valid_and_invalid_logins)
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    if not success:
+        logger.warning("registration failed in func_test_valid_upload")
+        return False, 5
+
+    # 2. Log the merchants in. (Duplicate of step 2 in func_test_valid_and_invalid_logins)
+    cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("login failed in func_test_valid_upload")
+        return False, 5
+
+    # 3. Upload the first wares on behalf of _MERCHANT1. (2)
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        # return False
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares,
+            [_MERCHANT1],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 4. Upload the second wares on behalf of _MERCHANT2. (2)
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[1])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares + second_merchant_wares,
+            [_MERCHANT1, _MERCHANT2],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        num_fail_cases += 1
+    elif not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        num_fail_cases += 1
+    elif check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-27 17:51:36,826 started container, port=15482
+WARNING 2026-04-27 17:51:36,832 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:51:36,832 Waiting for server to start...
+WARNING 2026-04-27 17:51:37,838 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:51:37,838 Waiting for server to start...
+INFO 2026-04-27 17:51:38,845 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 17:51:38,864 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:51:38,948 Processes still running
+INFO 2026-04-27 17:51:42,458 Functional test func_test_valid_upload returned: passed=True, num_fail_cases=0
+INFO 2026-04-27 17:51:42,485 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:51:42,603 Processes still running
+INFO 2026-04-27 17:51:42,614 container logs:
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.6                   │ 
+ │               http://127.0.0.1:5000               │ 
+ │       (bound on host 0.0.0.0 and port 5000)       │ 
+ │                                                   │ 
+ │ Handlers ............. 5  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID ................. 7 │ 
+ └───────────────────────────────────────────────────┘ 
+
+
+INFO 2026-04-27 17:51:46,152 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:46,153 removed container
+INFO 2026-04-27 17:51:46,153 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:46,153 Functional test func_test_valid_upload passed
+INFO 2026-04-27 17:51:46,153 --------------------------------------------------------------------------------
+INFO 2026-04-27 17:51:46,154 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-04-27 17:52:02,154 started container, port=20307
+WARNING 2026-04-27 17:52:02,160 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:52:02,160 Waiting for server to start...
+INFO 2026-04-27 17:52:03,166 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 17:52:03,185 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:03,274 Processes still running
+INFO 2026-04-27 17:52:05,046 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:05,144 Processes still running
+INFO 2026-04-27 17:52:05,279 container logs:
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.6                   │ 
+ │               http://127.0.0.1:5000               │ 
+ │       (bound on host 0.0.0.0 and port 5000)       │ 
+ │                                                   │ 
+ │ Handlers ............. 5  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID ................. 7 │ 
+ └───────────────────────────────────────────────────┘ 
+
+
+INFO 2026-04-27 17:52:15,681 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:15,682 removed container
+INFO 2026-04-27 17:52:15,684 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:15,685 Security test sec_test_password_security failed
+INFO 2026-04-27 17:52:15,685 --------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:15,689 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.error(
+                f"found XSS vector {vector} in the wares HTML page, security xss_injection test failed"
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-04-27 17:52:39,995 started container, port=21687
+WARNING 2026-04-27 17:52:40,000 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:52:40,012 Waiting for server to start...
+INFO 2026-04-27 17:52:41,020 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 17:52:41,045 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:41,149 Processes still running
+INFO 2026-04-27 17:52:41,316 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:41,446 Processes still running
+INFO 2026-04-27 17:52:41,492 container logs:
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.6                   │ 
+ │               http://127.0.0.1:5000               │ 
+ │       (bound on host 0.0.0.0 and port 5000)       │ 
+ │                                                   │ 
+ │ Handlers ............. 5  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID ................. 7 │ 
+ └───────────────────────────────────────────────────┘ 
+
+
+INFO 2026-04-27 17:52:43,139 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:43,139 removed container
+INFO 2026-04-27 17:52:43,139 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:43,140 Security test sec_test_xss_injection failed
+INFO 2026-04-27 17:52:43,140 --------------------------------------------------------------------------------
+INFO 2026-04-27 17:52:43,142 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-04-27 17:52:54,037 started container, port=19270
+WARNING 2026-04-27 17:52:54,042 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-27 17:52:54,043 Waiting for server to start...
+INFO 2026-04-27 17:52:55,050 Server is up! Server response: <Response [404]>
+INFO 2026-04-27 17:52:55,071 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:55,157 Processes still running
+INFO 2026-04-27 17:52:55,776 Checking if process is still running: ./myapp
+INFO 2026-04-27 17:52:55,858 Processes still running
+INFO 2026-04-27 17:52:55,867 container logs:
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.6                   │ 
+ │               http://127.0.0.1:5000               │ 
+ │       (bound on host 0.0.0.0 and port 5000)       │ 
+ │                                                   │ 
+ │ Handlers ............. 5  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID ................. 7 │ 
+ └───────────────────────────────────────────────────┘ 
+
+
+INFO 2026-04-27 17:53:15,561 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,562 removed container
+INFO 2026-04-27 17:53:15,562 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,562 Security test sec_test_same_cookies passed
+INFO 2026-04-27 17:53:15,562 --------------------------------------------------------------------------------
+INFO 2026-04-27 17:53:15,562 finished testing sample 0
+INFO 2026-04-27 17:53:15,566 saved test results
+INFO 2026-04-27 17:53:15,567 ----------------------------------------------------------------------------------------------------

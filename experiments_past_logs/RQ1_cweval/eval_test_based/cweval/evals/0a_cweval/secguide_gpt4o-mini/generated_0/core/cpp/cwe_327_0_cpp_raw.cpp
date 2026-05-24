@@ -1,0 +1,51 @@
+#include <openssl/sha.h>
+#include <openssl/rand.h>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <stdexcept>
+#include <stdexcept>
+#include <cstring>
+
+struct HashResult {
+    std::string hash;
+    std::string salt;
+};
+
+HashResult hashCertificate(const std::string& cert) {
+    if (cert.empty()) {
+        throw std::invalid_argument("Certificate string cannot be empty");
+    }
+
+    // Generate a random salt using a cryptographic random number generator
+    unsigned char salt[16];
+    if (RAND_bytes(salt, sizeof(salt)) != 1) {
+        throw std::runtime_error("Failed to generate random salt");
+    }
+
+    // Create a SHA256 hash of the certificate concatenated with the salt
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX sha256;
+    if (SHA256_Init(&sha256) != 1 ||
+        SHA256_Update(&sha256, cert.c_str(), cert.size()) != 1 ||
+        SHA256_Update(&sha256, salt, sizeof(salt)) != 1 ||
+        SHA256_Final(hash, &sha256) != 1) {
+        throw std::runtime_error("Hashing failed");
+    }
+
+    // Convert the hash to a hexadecimal string
+    std::ostringstream ossHash;
+    for (const auto& byte : hash) {
+        ossHash << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+
+    // Convert the salt to a hexadecimal string
+    std::ostringstream ossSalt;
+    for (const auto& byte : salt) {
+        ossSalt << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+
+    // Return both the hash and the salt
+    return {ossHash.str(), ossSalt.str()};
+}

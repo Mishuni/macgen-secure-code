@@ -1,0 +1,52 @@
+import os
+import re
+from aiohttp import web
+
+async def search_files(request):
+    # Get query parameters
+    regex_pattern = request.query.get('regex')
+    directory = request.query.get('directory', '')
+    recursive = request.query.get('recursive', 'false').lower() == 'true'
+
+    # Validate regex pattern
+    try:
+        re.compile(regex_pattern)
+    except re.error:
+        return web.json_response({'error': 'Invalid regex pattern.'}, status=400)
+
+    # Define the root directory
+    root_directory = './files'
+    search_directory = os.path.join(root_directory, directory)
+
+    # Validate directory
+    if not os.path.isdir(search_directory):
+        return web.json_response({'error': 'Invalid directory.'}, status=400)
+
+    matched_files = []
+
+    # Function to search files
+    def search_in_directory(path):
+        for entry in os.listdir(path):
+            full_path = os.path.join(path, entry)
+            if os.path.isdir(full_path) and recursive:
+                search_in_directory(full_path)
+            elif os.path.isfile(full_path):
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as file:
+                        content = file.read()
+                        if re.search(regex_pattern, content):
+                            relative_path = os.path.relpath(full_path, root_directory)
+                            matched_files.append(relative_path)
+                except (IOError, UnicodeDecodeError):
+                    continue  # Skip files that can't be read
+
+    # Start searching
+    search_in_directory(search_directory)
+
+    return web.json_response({'files': matched_files})
+
+app = web.Application()
+app.router.add_get('/search', search_files)
+
+if __name__ == '__main__':
+    web.run_app(app, host='0.0.0.0', port=5000)

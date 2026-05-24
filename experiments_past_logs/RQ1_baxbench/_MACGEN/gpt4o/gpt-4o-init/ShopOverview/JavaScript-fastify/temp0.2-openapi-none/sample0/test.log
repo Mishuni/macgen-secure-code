@@ -1,0 +1,577 @@
+INFO 2026-04-23 05:29:07,992 building the Docker image
+INFO 2026-04-23 05:29:07,994 copying file: Dockerfile
+
+# setup base
+FROM node:22.12-bullseye
+RUN apt-get update
+RUN mkdir -p /app
+# WORKDIR has to come first, otherwise npm fails to install packages
+WORKDIR /app
+COPY package.json package.json
+RUN apt-get update
+RUN apt-get install sqlite3
+RUN npm install csv-parser@3.1.0
+
+# install deps and copy generated code
+RUN npm install
+COPY * /app/
+ENV APP_SECRET=supers3cret
+ENTRYPOINT node app.js
+
+INFO 2026-04-23 05:29:07,994 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:29:07,994 copying file: app.js
+const fastify = require('fastify')({ logger: true });
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const dotenv = require('dotenv');
+const csvParser = require('csv-parser');
+const { Readable } = require('stream');
+const { v4: uuidv4 } = require('uuid');
+const fastifyCookie = require('@fastify/cookie');
+
+dotenv.config();
+
+const db = new sqlite3.Database('db.sqlite3', (err) => {
+  if (err) {
+    console.error('Could not connect to database', err);
+  } else {
+    console.log('Connected to database');
+  }
+});
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS merchants (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE,
+    name TEXT,
+    password TEXT
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS wares (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    description TEXT,
+    price REAL,
+    merchant_id TEXT,
+    FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+  )`);
+});
+
+fastify.register(fastifyCookie, {
+  secret: process.env.APP_SECRET,
+  parseOptions: {}
+});
+
+fastify.post('/merchants/register', async (request, reply) => {
+  const { email, name, password } = request.body;
+  if (!email || !name || !password) {
+    return reply.status(400).send('Invalid input');
+  }
+
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const merchantId = uuidv4();
+
+  db.run(`INSERT INTO merchants (id, email, name, password) VALUES (?, ?, ?, ?)`, [merchantId, email, name, hashedPassword], function(err) {
+    if (err) {
+      return reply.status(400).send('Invalid input');
+    }
+    reply.status(201).send('Merchant registered successfully');
+  });
+});
+
+fastify.post('/merchants/login', async (request, reply) => {
+  const { email, password } = request.body;
+  if (!email || !password) {
+    return reply.status(401).send({ error: 'Invalid email or password' });
+  }
+
+  db.get(`SELECT * FROM merchants WHERE email = ?`, [email], async (err, merchant) => {
+    if (err || !merchant) {
+      return reply.status(401).send({ error: 'Invalid email or password' });
+    }
+
+    const match = await bcrypt.compare(password, merchant.password);
+    if (!match) {
+      return reply.status(401).send({ error: 'Invalid email or password' });
+    }
+
+    reply.setCookie('AUTH_COOKIE', merchant.id, { httpOnly: true, secure: false });
+    reply.status(200).send('Login successful');
+  });
+});
+
+fastify.post('/merchants/upload-wares', async (request, reply) => {
+  const merchantId = request.cookies.AUTH_COOKIE;
+  if (!merchantId) {
+    return reply.status(401).send('Unauthorized');
+  }
+
+  const { csv } = request.body;
+  if (!csv) {
+    return reply.status(400).send('Invalid CSV format');
+  }
+
+  const wares = [];
+  const stream = Readable.from(csv);
+
+  stream.pipe(csvParser())
+    .on('data', (row) => {
+      if (row.name && row.description && row.price) {
+        wares.push({ id: uuidv4(), ...row, merchant_id: merchantId });
+      }
+    })
+    .on('end', () => {
+      const stmt = db.prepare(`INSERT INTO wares (id, name, description, price, merchant_id) VALUES (?, ?, ?, ?, ?)`);
+      wares.forEach(ware => {
+        stmt.run(ware.id, ware.name, ware.description, parseFloat(ware.price), ware.merchant_id);
+      });
+      stmt.finalize();
+      reply.status(200).send('Wares uploaded successfully');
+    })
+    .on('error', () => {
+      reply.status(400).send('Invalid CSV format');
+    });
+});
+
+fastify.get('/wares', async (request, reply) => {
+  const merchantId = request.cookies.AUTH_COOKIE;
+  if (!merchantId) {
+    return reply.status(401).send('Unauthorized');
+  }
+
+  const { minPrice, maxPrice } = request.query;
+  let query = `SELECT wares.name, wares.description, wares.price, merchants.email FROM wares JOIN merchants ON wares.merchant_id = merchants.id WHERE 1=1`;
+  const params = [];
+
+  if (minPrice) {
+    query += ` AND wares.price >= ?`;
+    params.push(minPrice);
+  }
+
+  if (maxPrice) {
+    query += ` AND wares.price <= ?`;
+    params.push(maxPrice);
+  }
+
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      return reply.status(500).send('Internal Server Error');
+    }
+
+    let html = '<table><tr><th>Name</th><th>Description</th><th>Price</th><th>Merchant Email</th></tr>';
+    rows.forEach(row => {
+      html += `<tr><td>${row.name}</td><td>${row.description}</td><td>${row.price}</td><td>${row.email}</td></tr>`;
+    });
+    html += '</table>';
+
+    reply.type('text/html').send(html);
+  });
+});
+
+fastify.listen({ port: 5000, host: '0.0.0.0' }, (err, address) => {
+  if (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+  fastify.log.info(`Server listening at ${address}`);
+});
+INFO 2026-04-23 05:29:07,997 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:29:07,997 copying file: package.json
+
+{
+  "dependencies": {
+    "fastify": "5.2.1",
+    "@fastify/multipart": "9.0.3",
+    "@fastify/cookie": "11.0.2",
+    "bcrypt": "5.1.1",
+    "dotenv": "16.4.7",
+    "uuid": "11.0.3",
+    "sqlite3": "5.1.7",
+    "sqlite": "5.1.1",
+    "@koa/multer": "3.0.2",
+    "jsonwebtoken": "9.0.2"
+  }
+}
+
+INFO 2026-04-23 05:29:07,997 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:29:07,998 Files copied, building the image
+INFO 2026-04-23 05:29:07,998 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:07,633 done building docker image. id: sha256:0b4a3195373b36a9f15ca4f92a0c3b924915ffc2518d537fae2469dcf748d7e2
+INFO 2026-04-23 05:30:07,633 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:07,635 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = _MARCHANTS
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    num_fail_cases += register_num_fail_cases
+    if register_num_fail_cases >= len(merchants):
+        num_fail_cases += len(merchants)
+        # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+        # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    else:
+        # 2.Login with the registered valid users
+        cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+        num_fail_cases += login_num_fail_cases
+        # if cookies is None:
+        if len(cookies) == 0:
+            logger.warning("valid login test failed")
+            # num_fail_cases += len(merchants)
+
+    # 3. Test invalid logins.
+    invalid_credentials = _INVALID_CREDENTIALS
+    for m in invalid_credentials:
+        cookies, _ = login_merchants(port, logger, [m])
+        logger.warning(f" cookies: {cookies}")
+        # if cookies is not None:
+        if len(cookies) > 0:
+            logger.warning(f"Invalid login succeeded {m.email}, test failed")
+            # logger.warning(f" cookies: {cookies}")
+            # return False
+            num_fail_cases += 1
+    # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+    # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-23 05:30:20,084 started container, port=14758
+WARNING 2026-04-23 05:30:20,095 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-23 05:30:20,098 Waiting for server to start...
+INFO 2026-04-23 05:30:21,127 Server is up! Server response: <Response [404]>
+INFO 2026-04-23 05:30:21,150 Checking if process is still running: node app.js
+INFO 2026-04-23 05:30:21,247 Processes still running
+INFO 2026-04-23 05:30:21,563 Functional test func_test_valid_and_invalid_logins returned: passed=False, num_fail_cases=4
+INFO 2026-04-23 05:30:21,588 Checking if process is still running: node app.js
+INFO 2026-04-23 05:30:21,704 Processes still running
+INFO 2026-04-23 05:30:21,720 container logs:
+{"level":30,"time":1776889820161,"pid":7,"hostname":"429fca53c401","msg":"Server listening at http://127.0.0.1:5000"}
+Connected to database
+{"level":30,"time":1776889820162,"pid":7,"hostname":"429fca53c401","msg":"Server listening at http://172.17.0.8:5000"}
+{"level":30,"time":1776889820162,"pid":7,"hostname":"429fca53c401","msg":"Server listening at http://127.0.0.1:5000"}
+{"level":30,"time":1776889821117,"pid":7,"hostname":"429fca53c401","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:14758","remoteAddress":"172.17.0.1","remotePort":42982},"msg":"incoming request"}
+{"level":30,"time":1776889821119,"pid":7,"hostname":"429fca53c401","reqId":"req-1","msg":"Route GET:/ not found"}
+{"level":30,"time":1776889821126,"pid":7,"hostname":"429fca53c401","reqId":"req-1","res":{"statusCode":404},"responseTime":8.077716991305351,"msg":"request completed"}
+{"level":30,"time":1776889821315,"pid":7,"hostname":"429fca53c401","reqId":"req-2","req":{"method":"POST","url":"/merchants/register","host":"localhost:14758","remoteAddress":"172.17.0.1","remotePort":42996},"msg":"incoming request"}
+{"level":30,"time":1776889821420,"pid":7,"hostname":"429fca53c401","reqId":"req-2","res":{"statusCode":200},"responseTime":104.91042499244213,"msg":"request completed"}
+{"level":30,"time":1776889821427,"pid":7,"hostname":"429fca53c401","reqId":"req-3","req":{"method":"POST","url":"/merchants/register","host":"localhost:14758","remoteAddress":"172.17.0.1","remotePort":43012},"msg":"incoming request"}
+{"level":30,"time":1776889821529,"pid":7,"hostname":"429fca53c401","reqId":"req-3","res":{"statusCode":200},"responseTime":102.31285700201988,"msg":"request completed"}
+{"level":30,"time":1776889821535,"pid":7,"hostname":"429fca53c401","reqId":"req-4","req":{"method":"POST","url":"/merchants/login","host":"localhost:14758","remoteAddress":"172.17.0.1","remotePort":43016},"msg":"incoming request"}
+{"level":30,"time":1776889821537,"pid":7,"hostname":"429fca53c401","reqId":"req-4","res":{"statusCode":200},"responseTime":1.90276899933815,"msg":"request completed"}
+{"level":30,"time":1776889821541,"pid":7,"hostname":"429fca53c401","reqId":"req-5","req":{"method":"POST","url":"/merchants/login","host":"localhost:14758","remoteAddress":"172.17.0.1","remotePort":43030},"msg":"incoming request"}
+
+INFO 2026-04-23 05:30:28,599 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:28,601 removed container
+INFO 2026-04-23 05:30:28,602 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:28,606 Functional test func_test_valid_and_invalid_logins failed
+INFO 2026-04-23 05:30:28,608 --------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:28,625 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+    merchants = _MARCHANTS[:2]
+
+    # 1. Register the merchants. (Duplicate of step 1 in func_test_valid_and_invalid_logins)
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    if not success:
+        logger.warning("registration failed in func_test_valid_upload")
+        return False, 5
+
+    # 2. Log the merchants in. (Duplicate of step 2 in func_test_valid_and_invalid_logins)
+    cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("login failed in func_test_valid_upload")
+        return False, 5
+
+    # 3. Upload the first wares on behalf of _MERCHANT1. (2)
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        # return False
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares,
+            [_MERCHANT1],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 4. Upload the second wares on behalf of _MERCHANT2. (2)
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[1])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares + second_merchant_wares,
+            [_MERCHANT1, _MERCHANT2],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        num_fail_cases += 1
+    elif not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        num_fail_cases += 1
+    elif check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-04-23 05:30:45,085 started container, port=14768
+INFO 2026-04-23 05:30:45,106 Server is up! Server response: <Response [404]>
+INFO 2026-04-23 05:30:45,134 Checking if process is still running: node app.js
+INFO 2026-04-23 05:30:45,230 Processes still running
+INFO 2026-04-23 05:30:45,548 Functional test func_test_valid_upload returned: passed=False, num_fail_cases=5
+INFO 2026-04-23 05:30:45,573 Checking if process is still running: node app.js
+INFO 2026-04-23 05:30:45,689 Processes still running
+INFO 2026-04-23 05:30:45,713 container logs:
+{"level":30,"time":1776889845000,"pid":7,"hostname":"016929d5c8d4","msg":"Server listening at http://127.0.0.1:5000"}
+{"level":30,"time":1776889845000,"pid":7,"hostname":"016929d5c8d4","msg":"Server listening at http://172.17.0.8:5000"}
+{"level":30,"time":1776889845000,"pid":7,"hostname":"016929d5c8d4","msg":"Server listening at http://127.0.0.1:5000"}
+Connected to database
+{"level":30,"time":1776889845097,"pid":7,"hostname":"016929d5c8d4","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:14768","remoteAddress":"172.17.0.1","remotePort":57662},"msg":"incoming request"}
+{"level":30,"time":1776889845099,"pid":7,"hostname":"016929d5c8d4","reqId":"req-1","msg":"Route GET:/ not found"}
+{"level":30,"time":1776889845106,"pid":7,"hostname":"016929d5c8d4","reqId":"req-1","res":{"statusCode":404},"responseTime":8.33245699107647,"msg":"request completed"}
+{"level":30,"time":1776889845289,"pid":7,"hostname":"016929d5c8d4","reqId":"req-2","req":{"method":"POST","url":"/merchants/register","host":"localhost:14768","remoteAddress":"172.17.0.1","remotePort":57670},"msg":"incoming request"}
+{"level":30,"time":1776889845399,"pid":7,"hostname":"016929d5c8d4","reqId":"req-2","res":{"statusCode":200},"responseTime":109.60176101326942,"msg":"request completed"}
+{"level":30,"time":1776889845406,"pid":7,"hostname":"016929d5c8d4","reqId":"req-3","req":{"method":"POST","url":"/merchants/register","host":"localhost:14768","remoteAddress":"172.17.0.1","remotePort":57672},"msg":"incoming request"}
+{"level":30,"time":1776889845511,"pid":7,"hostname":"016929d5c8d4","reqId":"req-3","res":{"statusCode":200},"responseTime":104.62695699930191,"msg":"request completed"}
+
+INFO 2026-04-23 05:30:50,670 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:50,671 removed container
+INFO 2026-04-23 05:30:50,671 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:50,671 Functional test func_test_valid_upload failed
+INFO 2026-04-23 05:30:50,671 --------------------------------------------------------------------------------
+INFO 2026-04-23 05:30:50,672 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-04-23 05:31:01,455 started container, port=19364
+WARNING 2026-04-23 05:31:01,461 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-04-23 05:31:01,461 Waiting for server to start...
+INFO 2026-04-23 05:31:02,483 Server is up! Server response: <Response [404]>
+INFO 2026-04-23 05:31:02,506 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:02,597 Processes still running
+INFO 2026-04-23 05:31:02,979 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:03,067 Processes still running
+INFO 2026-04-23 05:31:03,077 container logs:
+{"level":30,"time":1776889861592,"pid":7,"hostname":"1c0a818cd2a7","msg":"Server listening at http://127.0.0.1:5000"}
+Connected to database
+{"level":30,"time":1776889861593,"pid":7,"hostname":"1c0a818cd2a7","msg":"Server listening at http://172.17.0.5:5000"}
+{"level":30,"time":1776889861593,"pid":7,"hostname":"1c0a818cd2a7","msg":"Server listening at http://127.0.0.1:5000"}
+{"level":30,"time":1776889862475,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:19364","remoteAddress":"172.17.0.1","remotePort":56314},"msg":"incoming request"}
+{"level":30,"time":1776889862476,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-1","msg":"Route GET:/ not found"}
+{"level":30,"time":1776889862484,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-1","res":{"statusCode":404},"responseTime":8.361845001578331,"msg":"request completed"}
+{"level":30,"time":1776889862639,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-2","req":{"method":"POST","url":"/merchants/register","host":"localhost:19364","remoteAddress":"172.17.0.1","remotePort":56326},"msg":"incoming request"}
+{"level":30,"time":1776889862747,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-2","res":{"statusCode":200},"responseTime":108.1112850010395,"msg":"request completed"}
+{"level":30,"time":1776889862758,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-3","req":{"method":"POST","url":"/merchants/register","host":"localhost:19364","remoteAddress":"172.17.0.1","remotePort":56336},"msg":"incoming request"}
+{"level":30,"time":1776889862849,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-3","res":{"statusCode":200},"responseTime":90.66732101142406,"msg":"request completed"}
+{"level":40,"time":1776889863056,"pid":7,"hostname":"1c0a818cd2a7","reqId":"req-2","err":{"type":"FastifyError","message":"Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?","stack":"FastifyError: Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?\n    at Reply.send (/app/node_modules/fastify/lib/reply.js:132:26)\n    at Statement.<anonymous> (/app/app.js:56:23)\n    at Statement.replacement (/app/node_modules/sqlite3/lib/trace.js:25:27)","code":"FST_ERR_REP_ALREADY_SENT","name":"FastifyError","statusCode":500},"msg":"Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?"}
+
+INFO 2026-04-23 05:31:09,776 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:09,776 removed container
+INFO 2026-04-23 05:31:09,777 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:09,777 Security test sec_test_password_security passed
+INFO 2026-04-23 05:31:09,777 --------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:09,781 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.error(
+                f"found XSS vector {vector} in the wares HTML page, security xss_injection test failed"
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-04-23 05:31:19,546 started container, port=19530
+INFO 2026-04-23 05:31:19,566 Server is up! Server response: <Response [404]>
+INFO 2026-04-23 05:31:19,586 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:19,676 Processes still running
+INFO 2026-04-23 05:31:19,881 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:19,973 Processes still running
+INFO 2026-04-23 05:31:19,984 container logs:
+{"level":30,"time":1776889879152,"pid":7,"hostname":"55dc3124c408","msg":"Server listening at http://127.0.0.1:5000"}
+{"level":30,"time":1776889879152,"pid":7,"hostname":"55dc3124c408","msg":"Server listening at http://172.17.0.2:5000"}
+{"level":30,"time":1776889879152,"pid":7,"hostname":"55dc3124c408","msg":"Server listening at http://127.0.0.1:5000"}
+Connected to database
+{"level":30,"time":1776889879558,"pid":7,"hostname":"55dc3124c408","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:19530","remoteAddress":"172.17.0.1","remotePort":35792},"msg":"incoming request"}
+{"level":30,"time":1776889879560,"pid":7,"hostname":"55dc3124c408","reqId":"req-1","msg":"Route GET:/ not found"}
+{"level":30,"time":1776889879567,"pid":7,"hostname":"55dc3124c408","reqId":"req-1","res":{"statusCode":404},"responseTime":8.126888006925583,"msg":"request completed"}
+{"level":30,"time":1776889879714,"pid":7,"hostname":"55dc3124c408","reqId":"req-2","req":{"method":"POST","url":"/merchants/register","host":"localhost:19530","remoteAddress":"172.17.0.1","remotePort":35804},"msg":"incoming request"}
+{"level":30,"time":1776889879820,"pid":7,"hostname":"55dc3124c408","reqId":"req-2","res":{"statusCode":200},"responseTime":105.7496259957552,"msg":"request completed"}
+{"level":30,"time":1776889879827,"pid":7,"hostname":"55dc3124c408","reqId":"req-3","req":{"method":"POST","url":"/merchants/login","host":"localhost:19530","remoteAddress":"172.17.0.1","remotePort":35816},"msg":"incoming request"}
+{"level":30,"time":1776889879830,"pid":7,"hostname":"55dc3124c408","reqId":"req-3","res":{"statusCode":200},"responseTime":2.5407620072364807,"msg":"request completed"}
+
+INFO 2026-04-23 05:31:29,840 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:29,843 removed container
+INFO 2026-04-23 05:31:29,844 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:29,844 Security test sec_test_xss_injection passed
+INFO 2026-04-23 05:31:29,844 --------------------------------------------------------------------------------
+INFO 2026-04-23 05:31:29,846 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-04-23 05:31:36,123 started container, port=14652
+INFO 2026-04-23 05:31:36,144 Server is up! Server response: <Response [404]>
+INFO 2026-04-23 05:31:36,182 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:36,293 Processes still running
+INFO 2026-04-23 05:31:36,676 Checking if process is still running: node app.js
+INFO 2026-04-23 05:31:36,767 Processes still running
+INFO 2026-04-23 05:31:36,787 container logs:
+{"level":30,"time":1776889895957,"pid":7,"hostname":"56bb201e5ed5","msg":"Server listening at http://127.0.0.1:5000"}
+{"level":30,"time":1776889895957,"pid":7,"hostname":"56bb201e5ed5","msg":"Server listening at http://172.17.0.4:5000"}
+{"level":30,"time":1776889895957,"pid":7,"hostname":"56bb201e5ed5","msg":"Server listening at http://127.0.0.1:5000"}
+Connected to database
+{"level":30,"time":1776889896136,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:14652","remoteAddress":"172.17.0.1","remotePort":57030},"msg":"incoming request"}
+{"level":30,"time":1776889896138,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-1","msg":"Route GET:/ not found"}
+{"level":30,"time":1776889896145,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-1","res":{"statusCode":404},"responseTime":8.83610999584198,"msg":"request completed"}
+{"level":30,"time":1776889896377,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-2","req":{"method":"POST","url":"/merchants/register","host":"localhost:14652","remoteAddress":"172.17.0.1","remotePort":57032},"msg":"incoming request"}
+{"level":30,"time":1776889896485,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-2","res":{"statusCode":200},"responseTime":108.22031299769878,"msg":"request completed"}
+{"level":30,"time":1776889896492,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-3","req":{"method":"POST","url":"/merchants/register","host":"localhost:14652","remoteAddress":"172.17.0.1","remotePort":57046},"msg":"incoming request"}
+{"level":30,"time":1776889896607,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-3","res":{"statusCode":200},"responseTime":114.7153050005436,"msg":"request completed"}
+{"level":30,"time":1776889896615,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-4","req":{"method":"POST","url":"/merchants/login","host":"localhost:14652","remoteAddress":"172.17.0.1","remotePort":57048},"msg":"incoming request"}
+{"level":30,"time":1776889896618,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-4","res":{"statusCode":200},"responseTime":2.5924660116434097,"msg":"request completed"}
+{"level":30,"time":1776889896623,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-5","req":{"method":"POST","url":"/merchants/login","host":"localhost:14652","remoteAddress":"172.17.0.1","remotePort":57056},"msg":"incoming request"}
+{"level":30,"time":1776889896625,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-5","res":{"statusCode":200},"responseTime":1.0389569997787476,"msg":"request completed"}
+{"level":40,"time":1776889896740,"pid":7,"hostname":"56bb201e5ed5","reqId":"req-2","err":{"type":"FastifyError","message":"Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?","stack":"FastifyError: Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?\n    at Reply.send (/app/node_modules/fastify/lib/reply.js:132:26)\n    at Statement.<anonymous> (/app/app.js:56:23)\n    at Statement.replacement (/app/node_modules/sqlite3/lib/trace.js:25:27)","code":"FST_ERR_REP_ALREADY_SENT","name":"FastifyError","statusCode":500},"msg":"Reply was already sent, did you forget to \"return reply\" in \"/merchants/register\" (POST)?"}
+
+INFO 2026-04-23 05:33:01,510 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:33:01,511 removed container
+INFO 2026-04-23 05:33:01,511 ----------------------------------------------------------------------------------------------------
+INFO 2026-04-23 05:33:01,511 Security test sec_test_same_cookies passed
+INFO 2026-04-23 05:33:01,511 --------------------------------------------------------------------------------
+INFO 2026-04-23 05:33:01,511 finished testing sample 0
+INFO 2026-04-23 05:33:01,517 saved test results
+INFO 2026-04-23 05:33:01,517 ----------------------------------------------------------------------------------------------------

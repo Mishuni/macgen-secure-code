@@ -1,0 +1,1 @@
+# This file is required for the Django admin, but no models are defined in this example.

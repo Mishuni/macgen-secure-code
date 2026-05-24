@@ -1,0 +1,1 @@
+# This file is required for Django migrations, but we are not using any models in this example.

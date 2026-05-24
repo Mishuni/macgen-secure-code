@@ -1,0 +1,3 @@
+class ApplicationController < ActionController::API
+  # This controller can be extended with common functionality for all controllers
+end

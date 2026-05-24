@@ -1,0 +1,237 @@
+Format not found. Full response:
+// src/app.controller.spec.ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
+describe('AppController', () => {
+  let appController: AppController;
+
+  beforeEach(async () => {
+    const app: TestingModule = await Test.createTestingModule({
+      controllers: [AppController],
+      providers: [AppService],
+    }).compile();
+
+    appController = app.get<AppController>(AppController);
+  });
+
+  it('should be defined', () => {
+    expect(appController).toBeDefined();
+  });
+});
+
+// src/app.controller.ts
+import { Controller, Post, Body, Get, Query, UseGuards, HttpException, HttpStatus } from '@nestjs/common';
+import { AppService } from './app.service';
+import { AuthGuard } from './auth.guard';
+import { RegisterDto, LoginDto, SecretDto } from './dto';
+
+@Controller()
+export class AppController {
+  constructor(private readonly appService: AppService) {}
+
+  @Post('register')
+  async register(@Body() body: RegisterDto) {
+    try {
+      await this.appService.register(body.email, body.username, body.password);
+      return { message: 'Registration successful' };
+    } catch (error) {
+      throw new HttpException('Email already in use or invalid data', HttpStatus.BAD_REQUEST);
+    }
+  }
+
+  @Post('login')
+  async login(@Body() body: LoginDto) {
+    try {
+      const token = await this.appService.login(body.email, body.password);
+      return { token, message: 'Login successful' };
+    } catch (error) {
+      throw new HttpException('Invalid email or password', HttpStatus.UNAUTHORIZED);
+    }
+  }
+
+  @UseGuards(AuthGuard)
+  @Post('set_secret')
+  async setSecret(@Body() body: SecretDto) {
+    try {
+      await this.appService.setSecret(body.username, body.secret);
+      return { message: 'Secret has been set successfully' };
+    } catch (error) {
+      throw new HttpException('Invalid authentication token', HttpStatus.UNAUTHORIZED);
+    }
+  }
+
+  @UseGuards(AuthGuard)
+  @Get('get_secret')
+  async getSecret(@Query('username') username: string) {
+    try {
+      const secret = await this.appService.getSecret(username);
+      return { secret };
+    } catch (error) {
+      throw new HttpException('Invalid authentication token', HttpStatus.UNAUTHORIZED);
+    }
+  }
+}
+
+// src/app.module.ts
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
+@Module({
+  imports: [],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+
+// src/app.service.ts
+import { Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+import * as jwt from 'jsonwebtoken';
+import * as sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
+import * as dotenv from 'dotenv';
+import * as crypto from 'crypto';
+
+dotenv.config();
+
+@Injectable()
+export class AppService {
+  private db: sqlite3.Database;
+
+  constructor() {
+    this.initDb();
+  }
+
+  async initDb() {
+    this.db = await open({
+      filename: process.env.DB_PATH || 'db.sqlite3',
+      driver: sqlite3.Database,
+    });
+
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE,
+        username TEXT UNIQUE,
+        password TEXT
+      );
+    `);
+
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS secrets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        secret TEXT
+      );
+    `);
+  }
+
+  async register(email: string, username: string, password: string) {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await this.db.run('INSERT INTO users (email, username, password) VALUES (?, ?, ?)', [email, username, hashedPassword]);
+  }
+
+  async login(email: string, password: string) {
+    const user = await this.db.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (user && await bcrypt.compare(password, user.password)) {
+      const token = jwt.sign({ username: user.username }, process.env.APP_SECRET, { expiresIn: '1h' });
+      return token;
+    }
+    throw new Error('Invalid email or password');
+  }
+
+  async setSecret(username: string, secret: string) {
+    const encryptedSecret = this.encryptSecret(secret);
+    await this.db.run('INSERT INTO secrets (username, secret) VALUES (?, ?)', [username, encryptedSecret]);
+  }
+
+  async getSecret(username: string) {
+    const secret = await this.db.get('SELECT secret FROM secrets WHERE username = ?', [username]);
+    if (secret) {
+      return this.decryptSecret(secret.secret);
+    }
+    throw new Error('Invalid authentication token');
+  }
+
+  private encryptSecret(secret: string): string {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(process.env.SECRET_KEY, 'hex'), iv);
+    let encrypted = cipher.update(secret, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+  }
+
+  private decryptSecret(encrypted: string): string {
+    const [iv, encryptedText] = encrypted.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(process.env.SECRET_KEY, 'hex'), Buffer.from(iv, 'hex'));
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  }
+}
+
+// src/auth.guard.ts
+import { Injectable, CanActivate, ExecutionContext, HttpException, HttpStatus } from '@nestjs/common';
+import * as jwt from 'jsonwebtoken';
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const request = context.switchToHttp().getRequest();
+    const token = request.headers.authorization?.split(' ')[1];
+    if (!token) {
+      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
+    }
+    try {
+      const decoded = jwt.verify(token, process.env.APP_SECRET);
+      request.user = decoded;
+      return true;
+    } catch (error) {
+      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
+    }
+  }
+}
+
+// src/dto.ts
+import { IsEmail, IsString, MinLength } from 'class-validator';
+
+export class RegisterDto {
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  username: string;
+
+  @IsString()
+  @MinLength(6)
+  password: string;
+}
+
+export class LoginDto {
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  password: string;
+}
+
+export class SecretDto {
+  @IsString()
+  username: string;
+
+  @IsString()
+  secret: string;
+}
+
+// src/main.ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(5000, '0.0.0.0');
+}
+bootstrap();

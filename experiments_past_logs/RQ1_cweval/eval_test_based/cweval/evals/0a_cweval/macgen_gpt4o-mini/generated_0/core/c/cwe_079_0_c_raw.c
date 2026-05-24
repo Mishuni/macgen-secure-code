@@ -1,0 +1,49 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_USERNAME_LENGTH 50
+
+// Function to sanitize the username for HTML rendering
+void sanitize_input(const char* input, char* output, size_t output_size) {
+    const char* special_chars[] = {"&", "<", ">", "\"", "'"};
+    const char* replacements[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
+    size_t i;
+
+    strncpy(output, input, output_size);
+    output[output_size - 1] = '\0'; // Ensure null termination
+
+    for (i = 0; i < sizeof(special_chars) / sizeof(special_chars[0]); i++) {
+        char* pos = strstr(output, special_chars[i]);
+        while (pos != NULL) {
+            size_t len = strlen(output);
+            size_t replacement_len = strlen(replacements[i]);
+            if (len + replacement_len - strlen(special_chars[i]) < output_size) {
+                memmove(pos + replacement_len, pos + strlen(special_chars[i]), len - (pos - output) + 1);
+                memcpy(pos, replacements[i], replacement_len);
+            }
+            pos = strstr(output, special_chars[i]);
+        }
+    }
+}
+
+char* get_welcome_message(const char* username) {
+    if (strlen(username) > MAX_USERNAME_LENGTH) {
+        return NULL;
+    }
+
+    char sanitized_username[MAX_USERNAME_LENGTH * 6]; // Enough space for replacements
+    sanitize_input(username, sanitized_username, sizeof(sanitized_username));
+
+    const char* welcome_prefix = "Welcome, ";
+    size_t username_length = strlen(sanitized_username);
+    size_t message_length = strlen(welcome_prefix) + username_length + 2; // +1 for '!' and +1 for null terminator
+
+    char* message = (char*)malloc(message_length);
+    if (message == NULL) {
+        return NULL;
+    }
+
+    snprintf(message, message_length, "%s%s!", welcome_prefix, sanitized_username);
+    return message;
+}

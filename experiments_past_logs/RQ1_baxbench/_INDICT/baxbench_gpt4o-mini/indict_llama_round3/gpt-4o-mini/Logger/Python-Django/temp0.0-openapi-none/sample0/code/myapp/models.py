@@ -1,0 +1,1 @@
+# No models are needed for this simple logging service.

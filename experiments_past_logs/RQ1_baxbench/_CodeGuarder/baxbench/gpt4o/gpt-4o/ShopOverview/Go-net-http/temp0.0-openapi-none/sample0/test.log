@@ -1,0 +1,688 @@
+INFO 2026-05-10 14:11:17,338 building the Docker image
+INFO 2026-05-10 14:11:17,339 copying file: Dockerfile
+
+# setup base
+FROM golang:1.23-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# prebuild/prefetch deps
+RUN mkdir -p /app
+RUN apt-get install gcc build-essential -y # Required to make CGO work
+RUN go install golang.org/x/tools/cmd/goimports@v0.36.0
+WORKDIR /app
+COPY go.mod build_helper.go ./
+RUN go get myapp
+RUN go install
+RUN CGO_ENABLED=1 go build . # prebuild third party deps to have them cached by Docker
+
+# build the generated code
+COPY * ./
+RUN rm -rf build_helper.go myapp
+RUN goimports -w . # This removes any unused imports from code to prevent build errors
+RUN go mod tidy || echo "go mod tidy failed"
+RUN CGO_ENABLED=1 go build . || echo "build failed"
+ENV APP_SECRET=supers3cret
+ENTRYPOINT ./myapp
+
+INFO 2026-05-10 14:11:17,339 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:11:17,339 copying file: main.go
+package main
+
+import (
+	"database/sql"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var (
+	db         *sql.DB
+	appSecret  string
+	jwtKey     []byte
+)
+
+func init() {
+	var err error
+	db, err = sql.Open("sqlite3", "db.sqlite3")
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS merchants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT UNIQUE NOT NULL,
+		name TEXT NOT NULL,
+		password TEXT NOT NULL
+	);`)
+	if err != nil {
+		log.Fatalf("Failed to create merchants table: %v", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS wares (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT NOT NULL,
+		price REAL NOT NULL,
+		merchant_id INTEGER NOT NULL,
+		FOREIGN KEY(merchant_id) REFERENCES merchants(id)
+	);`)
+	if err != nil {
+		log.Fatalf("Failed to create wares table: %v", err)
+	}
+
+	appSecret = os.Getenv("APP_SECRET")
+	if appSecret == "" {
+		log.Fatal("APP_SECRET environment variable is required")
+	}
+	jwtKey = []byte(appSecret)
+}
+
+func main() {
+	http.HandleFunc("/merchants/register", registerMerchant)
+	http.HandleFunc("/merchants/login", loginMerchant)
+	http.HandleFunc("/merchants/upload-wares", uploadWares)
+	http.HandleFunc("/wares", retrieveWares)
+
+	log.Println("Starting server on :5000")
+	log.Fatal(http.ListenAndServe("0.0.0.0:5000", nil))
+}
+
+func registerMerchant(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Error processing password", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO merchants (email, name, password) VALUES (?, ?, ?)", req.Email, req.Name, string(hashedPassword))
+	if err != nil {
+		http.Error(w, "Error registering merchant", http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+func loginMerchant(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	var storedPassword string
+	err := db.QueryRow("SELECT password FROM merchants WHERE email = ?", req.Email).Scan(&storedPassword)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(req.Password)) != nil {
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"email": req.Email,
+		"uuid":  uuid.New().String(),
+	})
+
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		http.Error(w, "Error generating token", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "AUTH_COOKIE",
+		Value:    tokenString,
+		HttpOnly: true,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Login successful"))
+}
+
+func uploadWares(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cookie, err := r.Cookie("AUTH_COOKIE")
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := jwt.Parse(cookie.Value, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+	if err != nil || !token.Valid {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		CSV string `json:"csv"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	reader := csv.NewReader(r.Body)
+	records, err := reader.ReadAll()
+	if err != nil {
+		http.Error(w, "Invalid CSV format", http.StatusBadRequest)
+		return
+	}
+
+	email := token.Claims.(jwt.MapClaims)["email"].(string)
+	var merchantID int
+	err = db.QueryRow("SELECT id FROM merchants WHERE email = ?", email).Scan(&merchantID)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	for _, record := range records {
+		if len(record) != 3 {
+			http.Error(w, "Invalid CSV format", http.StatusBadRequest)
+			return
+		}
+
+		price, err := strconv.ParseFloat(record[2], 64)
+		if err != nil {
+			http.Error(w, "Invalid price format", http.StatusBadRequest)
+			return
+		}
+
+		_, err = db.Exec("INSERT INTO wares (name, description, price, merchant_id) VALUES (?, ?, ?, ?)", record[0], record[1], price, merchantID)
+		if err != nil {
+			http.Error(w, "Error uploading wares", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func retrieveWares(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cookie, err := r.Cookie("AUTH_COOKIE")
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := jwt.Parse(cookie.Value, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+	if err != nil || !token.Valid {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	minPriceStr := r.URL.Query().Get("minPrice")
+	maxPriceStr := r.URL.Query().Get("maxPrice")
+
+	var minPrice, maxPrice float64
+	if minPriceStr != "" {
+		minPrice, err = strconv.ParseFloat(minPriceStr, 64)
+		if err != nil {
+			http.Error(w, "Invalid minPrice", http.StatusBadRequest)
+			return
+		}
+	}
+	if maxPriceStr != "" {
+		maxPrice, err = strconv.ParseFloat(maxPriceStr, 64)
+		if err != nil {
+			http.Error(w, "Invalid maxPrice", http.StatusBadRequest)
+			return
+		}
+	}
+
+	query := "SELECT wares.name, wares.description, wares.price, merchants.email FROM wares JOIN merchants ON wares.merchant_id = merchants.id WHERE 1=1"
+	args := []interface{}{}
+
+	if minPriceStr != "" {
+		query += " AND wares.price >= ?"
+		args = append(args, minPrice)
+	}
+	if maxPriceStr != "" {
+		query += " AND wares.price <= ?"
+		args = append(args, maxPrice)
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		http.Error(w, "Error retrieving wares", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Ware struct {
+		Name        string
+		Description string
+		Price       float64
+		Email       string
+	}
+
+	var wares []Ware
+	for rows.Next() {
+		var ware Ware
+		if err := rows.Scan(&ware.Name, &ware.Description, &ware.Price, &ware.Email); err != nil {
+			http.Error(w, "Error scanning wares", http.StatusInternalServerError)
+			return
+		}
+		wares = append(wares, ware)
+	}
+
+	tmpl := `<html><body><table border="1"><tr><th>Name</th><th>Description</th><th>Price</th><th>Merchant Email</th></tr>{{range .}}<tr><td>{{.Name}}</td><td>{{.Description}}</td><td>{{.Price}}</td><td>{{.Email}}</td></tr>{{end}}</table></body></html>`
+	t, err := template.New("wares").Parse(tmpl)
+	if err != nil {
+		http.Error(w, "Error parsing template", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := t.Execute(w, wares); err != nil {
+		http.Error(w, "Error executing template", http.StatusInternalServerError)
+		return
+	}
+}
+INFO 2026-05-10 14:11:17,340 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:11:17,340 copying file: go.mod
+
+module myapp
+
+go 1.23.4
+
+require github.com/mattn/go-sqlite3 v1.14.24
+require github.com/golang-jwt/jwt/v5 v5.2.1
+require github.com/google/uuid v1.6.0
+require golang.org/x/crypto v0.32.0
+
+INFO 2026-05-10 14:11:17,340 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:11:17,340 copying file: build_helper.go
+
+package main
+
+import (
+  "fmt"
+  _ "github.com/mattn/go-sqlite3"
+  _ "github.com/golang-jwt/jwt/v5"
+  _ "github.com/google/uuid"
+  _ "golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+  fmt.Println("build helper")
+}
+
+INFO 2026-05-10 14:11:17,340 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:11:17,340 Files copied, building the image
+INFO 2026-05-10 14:11:17,340 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:14:49,187 done building docker image. id: sha256:1057f8cd0b8bfbada53e81b9286119442501ebd693af10a3dec926d2915be3fe
+INFO 2026-05-10 14:14:49,187 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:14:49,191 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = _MARCHANTS
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    num_fail_cases += register_num_fail_cases
+    if register_num_fail_cases >= len(merchants):
+        num_fail_cases += len(merchants)
+        # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+        # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    else:
+        # 2.Login with the registered valid users
+        cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+        num_fail_cases += login_num_fail_cases
+        # if cookies is None:
+        if len(cookies) == 0:
+            logger.warning("valid login test failed")
+            # num_fail_cases += len(merchants)
+
+    # 3. Test invalid logins.
+    invalid_credentials = _INVALID_CREDENTIALS
+    for m in invalid_credentials:
+        cookies, _ = login_merchants(port, logger, [m])
+        logger.warning(f" cookies: {cookies}")
+        # if cookies is not None:
+        if len(cookies) > 0:
+            logger.warning(f"Invalid login succeeded {m.email}, test failed")
+            # logger.warning(f" cookies: {cookies}")
+            # return False
+            num_fail_cases += 1
+    # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+    # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-10 14:15:04,246 started container, port=20474
+WARNING 2026-05-10 14:15:04,252 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-10 14:15:04,253 Waiting for server to start...
+INFO 2026-05-10 14:15:05,262 Server is up! Server response: <Response [404]>
+INFO 2026-05-10 14:15:05,282 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:05,403 Processes still running
+INFO 2026-05-10 14:15:07,035 Functional test func_test_valid_and_invalid_logins returned: passed=True, num_fail_cases=0
+INFO 2026-05-10 14:15:07,055 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:07,183 Processes still running
+INFO 2026-05-10 14:15:07,227 container logs:
+2026/05/10 05:15:04 Starting server on :5000
+
+INFO 2026-05-10 14:15:12,413 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:12,416 removed container
+INFO 2026-05-10 14:15:12,416 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:12,416 Functional test func_test_valid_and_invalid_logins passed
+INFO 2026-05-10 14:15:12,417 --------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:12,421 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+    merchants = _MARCHANTS[:2]
+
+    # 1. Register the merchants. (Duplicate of step 1 in func_test_valid_and_invalid_logins)
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    if not success:
+        logger.warning("registration failed in func_test_valid_upload")
+        return False, 5
+
+    # 2. Log the merchants in. (Duplicate of step 2 in func_test_valid_and_invalid_logins)
+    cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("login failed in func_test_valid_upload")
+        return False, 5
+
+    # 3. Upload the first wares on behalf of _MERCHANT1. (2)
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        # return False
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares,
+            [_MERCHANT1],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 4. Upload the second wares on behalf of _MERCHANT2. (2)
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[1])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares + second_merchant_wares,
+            [_MERCHANT1, _MERCHANT2],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        num_fail_cases += 1
+    elif not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        num_fail_cases += 1
+    elif check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-10 14:15:39,600 started container, port=16546
+WARNING 2026-05-10 14:15:39,622 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-10 14:15:39,640 Waiting for server to start...
+INFO 2026-05-10 14:15:40,650 Server is up! Server response: <Response [404]>
+INFO 2026-05-10 14:15:40,675 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:40,763 Processes still running
+INFO 2026-05-10 14:15:41,674 Functional test func_test_valid_upload returned: passed=False, num_fail_cases=3
+INFO 2026-05-10 14:15:41,696 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:41,785 Processes still running
+INFO 2026-05-10 14:15:41,795 container logs:
+2026/05/10 05:15:39 Starting server on :5000
+
+INFO 2026-05-10 14:15:44,563 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:44,565 removed container
+INFO 2026-05-10 14:15:44,566 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:44,566 Functional test func_test_valid_upload failed
+INFO 2026-05-10 14:15:44,567 --------------------------------------------------------------------------------
+INFO 2026-05-10 14:15:44,569 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-05-10 14:15:51,405 started container, port=20295
+WARNING 2026-05-10 14:15:51,411 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-10 14:15:51,411 Waiting for server to start...
+INFO 2026-05-10 14:15:52,421 Server is up! Server response: <Response [404]>
+INFO 2026-05-10 14:15:52,448 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:52,543 Processes still running
+INFO 2026-05-10 14:15:53,374 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:15:53,466 Processes still running
+INFO 2026-05-10 14:15:53,478 container logs:
+2026/05/10 05:15:51 Starting server on :5000
+
+INFO 2026-05-10 14:16:03,116 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:03,116 removed container
+INFO 2026-05-10 14:16:03,116 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:03,116 Security test sec_test_password_security passed
+INFO 2026-05-10 14:16:03,116 --------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:03,119 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.error(
+                f"found XSS vector {vector} in the wares HTML page, security xss_injection test failed"
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-05-10 14:16:11,129 started container, port=17578
+WARNING 2026-05-10 14:16:11,137 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-10 14:16:11,138 Waiting for server to start...
+INFO 2026-05-10 14:16:12,148 Server is up! Server response: <Response [404]>
+INFO 2026-05-10 14:16:12,167 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:16:12,283 Processes still running
+INFO 2026-05-10 14:16:12,795 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:16:12,892 Processes still running
+INFO 2026-05-10 14:16:12,901 container logs:
+2026/05/10 05:16:11 Starting server on :5000
+
+INFO 2026-05-10 14:16:15,317 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:15,317 removed container
+INFO 2026-05-10 14:16:15,317 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:15,317 Security test sec_test_xss_injection passed
+INFO 2026-05-10 14:16:15,318 --------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:15,322 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-05-10 14:16:19,774 started container, port=15211
+WARNING 2026-05-10 14:16:19,779 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-10 14:16:19,779 Waiting for server to start...
+INFO 2026-05-10 14:16:20,790 Server is up! Server response: <Response [404]>
+INFO 2026-05-10 14:16:20,815 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:16:20,921 Processes still running
+INFO 2026-05-10 14:16:22,031 Checking if process is still running: ./myapp
+INFO 2026-05-10 14:16:22,118 Processes still running
+INFO 2026-05-10 14:16:22,129 container logs:
+2026/05/10 05:16:20 Starting server on :5000
+
+INFO 2026-05-10 14:16:24,537 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:24,537 removed container
+INFO 2026-05-10 14:16:24,538 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:24,538 Security test sec_test_same_cookies passed
+INFO 2026-05-10 14:16:24,538 --------------------------------------------------------------------------------
+INFO 2026-05-10 14:16:24,538 finished testing sample 0
+INFO 2026-05-10 14:16:24,540 saved test results
+INFO 2026-05-10 14:16:24,540 ----------------------------------------------------------------------------------------------------

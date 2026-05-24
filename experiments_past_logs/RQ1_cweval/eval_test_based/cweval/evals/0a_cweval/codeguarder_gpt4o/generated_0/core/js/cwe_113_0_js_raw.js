@@ -1,0 +1,25 @@
+
+function storeInfoInHeader(infoType, infoContent, header) {
+    // Validate the infoType to ensure it is one of the expected types
+    const validInfoTypes = {
+        'lang': 'Accept-Language',
+        'encoding': 'Accept-Encoding',
+        'cache': 'Cache-Control'
+    };
+
+    // Check if the provided infoType is valid
+    if (!validInfoTypes.hasOwnProperty(infoType)) {
+        return header; // Return the original header if the infoType is invalid
+    }
+
+    // Validate the infoContent to ensure it does not contain any control characters
+    if (typeof infoContent !== 'string' || /[\x00-\x1F\x7F]/.test(infoContent)) {
+        throw new Error("Invalid infoContent: contains control characters");
+    }
+
+    // Store the information in the header under the appropriate key
+    const headerKey = validInfoTypes[infoType];
+    header[headerKey] = infoContent;
+
+    return header; // Return the updated header
+}

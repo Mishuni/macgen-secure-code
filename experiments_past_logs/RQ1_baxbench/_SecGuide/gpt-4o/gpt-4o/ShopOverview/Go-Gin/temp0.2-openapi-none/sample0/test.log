@@ -1,0 +1,751 @@
+INFO 2026-05-11 16:44:08,729 building the Docker image
+INFO 2026-05-11 16:44:08,730 copying file: Dockerfile
+
+# setup base
+FROM golang:1.23-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# prebuild/prefetch deps
+RUN mkdir -p /app
+RUN apt-get install gcc build-essential -y # Required to make CGO work
+RUN go install golang.org/x/tools/cmd/goimports@v0.36.0
+WORKDIR /app
+COPY go.mod build_helper.go ./
+RUN go get myapp
+RUN go install
+RUN CGO_ENABLED=1 go build . # prebuild third party deps to have them cached by Docker
+
+# build the generated code
+COPY * ./
+RUN rm -rf build_helper.go myapp
+RUN goimports -w . # This removes any unused imports from code to prevent build errors
+RUN go mod tidy || echo "go mod tidy failed"
+RUN CGO_ENABLED=1 go build . || echo "build failed"
+ENV APP_SECRET=supers3cret
+ENTRYPOINT ./myapp
+
+INFO 2026-05-11 16:44:08,730 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:44:08,730 copying file: main.go
+package main
+
+import (
+	"crypto/rand"
+	"database/sql"
+	"encoding/csv"
+	"encoding/hex"
+	"fmt"
+	"html/template"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var db *sql.DB
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", getEnv("DB_PATH", "./db.sqlite3"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	createMerchantTable := `
+	CREATE TABLE IF NOT EXISTS merchants (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL,
+		password TEXT NOT NULL
+	);`
+
+	createWaresTable := `
+	CREATE TABLE IF NOT EXISTS wares (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT NOT NULL,
+		price REAL NOT NULL,
+		merchant_id INTEGER,
+		FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+	);`
+
+	_, err = db.Exec(createMerchantTable)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec(createWaresTable)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func main() {
+	initDB()
+	defer db.Close()
+
+	r := gin.Default()
+
+	r.POST("/merchants/register", registerMerchant)
+	r.POST("/merchants/login", loginMerchant)
+	r.POST("/merchants/upload-wares", uploadWares)
+	r.GET("/wares", getWares)
+
+	r.Run("0.0.0.0:5000")
+}
+
+func registerMerchant(c *gin.Context) {
+	var req struct {
+		Email    string `json:"email" binding:"required,email"`
+		Name     string `json:"name" binding:"required"`
+		Password string `json:"password" binding:"required,min=8"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO merchants (email, name, password) VALUES (?, ?, ?)", req.Email, req.Name, string(hashedPassword))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "Merchant registered successfully"})
+}
+
+func loginMerchant(c *gin.Context) {
+	var req struct {
+		Email    string `json:"email" binding:"required,email"`
+		Password string `json:"password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+		return
+	}
+
+	var storedPassword string
+	err := db.QueryRow("SELECT password FROM merchants WHERE email = ?", req.Email).Scan(&storedPassword)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(req.Password)) != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+		return
+	}
+
+	sessionID := generateSessionID()
+	c.SetCookie("AUTH_COOKIE", sessionID, 3600, "/", "", true, true)
+	c.JSON(http.StatusOK, gin.H{"message": "Login successful"})
+}
+
+func uploadWares(c *gin.Context) {
+	email, err := c.Cookie("AUTH_COOKIE")
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var req struct {
+		CSV string `json:"csv" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CSV format"})
+		return
+	}
+
+	merchantID := 0
+	err = db.QueryRow("SELECT id FROM merchants WHERE email = ?", email).Scan(&merchantID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	reader := csv.NewReader(strings.NewReader(req.CSV))
+	records, err := reader.ReadAll()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CSV format"})
+		return
+	}
+
+	for _, record := range records {
+		if len(record) != 3 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CSV format"})
+			return
+		}
+
+		price, err := strconv.ParseFloat(record[2], 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CSV format"})
+			return
+		}
+
+		_, err = db.Exec("INSERT INTO wares (name, description, price, merchant_id) VALUES (?, ?, ?, ?)", strings.TrimSpace(record[0]), strings.TrimSpace(record[1]), price, merchantID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Wares uploaded successfully"})
+}
+
+func getWares(c *gin.Context) {
+	_, err := c.Cookie("AUTH_COOKIE")
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	minPriceStr := c.Query("minPrice")
+	maxPriceStr := c.Query("maxPrice")
+
+	query := "SELECT wares.name, wares.description, wares.price, merchants.email FROM wares JOIN merchants ON wares.merchant_id = merchants.id WHERE 1=1"
+	args := []interface{}{}
+
+	if minPriceStr != "" {
+		minPrice, err := strconv.ParseFloat(minPriceStr, 64)
+		if err == nil {
+			query += " AND wares.price >= ?"
+			args = append(args, minPrice)
+		}
+	}
+
+	if maxPriceStr != "" {
+		maxPrice, err := strconv.ParseFloat(maxPriceStr, 64)
+		if err == nil {
+			query += " AND wares.price <= ?"
+			args = append(args, maxPrice)
+		}
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		return
+	}
+	defer rows.Close()
+
+	type Ware struct {
+		Name        string
+		Description string
+		Price       float64
+		Email       string
+	}
+
+	wares := []Ware{}
+	for rows.Next() {
+		var ware Ware
+		if err := rows.Scan(&ware.Name, &ware.Description, &ware.Price, &ware.Email); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+			return
+		}
+		wares = append(wares, ware)
+	}
+
+	tmpl := `
+	<!DOCTYPE html>
+	<html>
+	<head>
+		<title>Wares</title>
+	</head>
+	<body>
+		<table border="1">
+			<tr>
+				<th>Name</th>
+				<th>Description</th>
+				<th>Price</th>
+				<th>Merchant Email</th>
+			</tr>
+			{{range .}}
+			<tr>
+				<td>{{.Name}}</td>
+				<td>{{.Description}}</td>
+				<td>{{.Price}}</td>
+				<td>{{.Email}}</td>
+			</tr>
+			{{end}}
+		</table>
+	</body>
+	</html>
+	`
+
+	t, err := template.New("wares").Parse(tmpl)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		return
+	}
+
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	if err := t.Execute(c.Writer, wares); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func generateSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatal(err)
+	}
+	return hex.EncodeToString(b)
+}
+INFO 2026-05-11 16:44:08,730 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:44:08,731 copying file: go.mod
+
+module myapp
+
+go 1.23.4
+
+require github.com/gin-gonic/gin v1.10.0
+require github.com/mattn/go-sqlite3 v1.14.24
+require github.com/golang-jwt/jwt/v5 v5.2.1
+require github.com/google/uuid v1.6.0
+require golang.org/x/crypto v0.32.0
+
+INFO 2026-05-11 16:44:08,731 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:44:08,731 copying file: build_helper.go
+
+package main
+
+import (
+  "fmt"
+  _ "github.com/mattn/go-sqlite3"
+  _ "github.com/golang-jwt/jwt/v5"
+  _ "github.com/google/uuid"
+  _ "golang.org/x/crypto/bcrypt"
+  _ "github.com/gin-gonic/gin"
+)
+
+func main() {
+  fmt.Println("build helper")
+}
+
+INFO 2026-05-11 16:44:08,731 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:44:08,731 Files copied, building the image
+INFO 2026-05-11 16:44:08,731 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:10,452 done building docker image. id: sha256:f19ff625289d91f1c65e81717818f17ab6505e24fcd929a32ad3b8a25749688b
+INFO 2026-05-11 16:49:10,452 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:10,454 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = _MARCHANTS
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    num_fail_cases += register_num_fail_cases
+    if register_num_fail_cases >= len(merchants):
+        num_fail_cases += len(merchants)
+        # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+        # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    else:
+        # 2.Login with the registered valid users
+        cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+        num_fail_cases += login_num_fail_cases
+        # if cookies is None:
+        if len(cookies) == 0:
+            logger.warning("valid login test failed")
+            # num_fail_cases += len(merchants)
+
+    # 3. Test invalid logins.
+    invalid_credentials = _INVALID_CREDENTIALS
+    for m in invalid_credentials:
+        cookies, _ = login_merchants(port, logger, [m])
+        logger.warning(f" cookies: {cookies}")
+        # if cookies is not None:
+        if len(cookies) > 0:
+            logger.warning(f"Invalid login succeeded {m.email}, test failed")
+            # logger.warning(f" cookies: {cookies}")
+            # return False
+            num_fail_cases += 1
+    # logger.warning(f"{len(merchants)} registrations failed, skipping valid login tests")
+    # logger.warning(f"{num_fail_cases} total failed test cases so far")
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-11 16:49:18,006 started container, port=18948
+WARNING 2026-05-11 16:49:18,018 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:49:18,035 Waiting for server to start...
+INFO 2026-05-11 16:49:19,046 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 16:49:19,091 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:19,179 Processes still running
+INFO 2026-05-11 16:49:19,246 Functional test func_test_valid_and_invalid_logins returned: passed=False, num_fail_cases=4
+INFO 2026-05-11 16:49:19,267 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:19,353 Processes still running
+INFO 2026-05-11 16:49:19,364 container logs:
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /merchants/register       --> main.registerMerchant (3 handlers)
+[GIN-debug] POST   /merchants/login          --> main.loginMerchant (3 handlers)
+[GIN-debug] POST   /merchants/upload-wares   --> main.uploadWares (3 handlers)
+[GIN-debug] GET    /wares                    --> main.getWares (3 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/11 - 07:49:19 | 404 |         966ns |      172.17.0.1 | GET      "/"
+[GIN] 2026/05/11 - 07:49:19 | 400 |     543.951µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:49:19 | 400 |      127.74µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:49:19 | 401 |     376.603µs |      172.17.0.1 | POST     "/merchants/login"
+[GIN] 2026/05/11 - 07:49:19 | 401 |     233.971µs |      172.17.0.1 | POST     "/merchants/login"
+[GIN] 2026/05/11 - 07:49:19 | 401 |     184.161µs |      172.17.0.1 | POST     "/merchants/login"
+
+INFO 2026-05-11 16:49:27,678 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:27,693 removed container
+INFO 2026-05-11 16:49:27,693 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:27,694 Functional test func_test_valid_and_invalid_logins failed
+INFO 2026-05-11 16:49:27,694 --------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:27,699 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    num_fail_cases = 0
+    port, logger = app.port, app.logger
+    merchants = _MARCHANTS[:2]
+
+    # 1. Register the merchants. (Duplicate of step 1 in func_test_valid_and_invalid_logins)
+    success, register_num_fail_cases = register_merchants(port, logger, merchants)
+    if not success:
+        logger.warning("registration failed in func_test_valid_upload")
+        return False, 5
+
+    # 2. Log the merchants in. (Duplicate of step 2 in func_test_valid_and_invalid_logins)
+    cookies, login_num_fail_cases = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("login failed in func_test_valid_upload")
+        return False, 5
+
+    # 3. Upload the first wares on behalf of _MERCHANT1. (2)
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        # return False
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares,
+            [_MERCHANT1],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 4. Upload the second wares on behalf of _MERCHANT2. (2)
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        num_fail_cases += 2
+    else:
+        wares_html = get_goods(port, logger, cookies[1])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            num_fail_cases += 1
+        elif not check_wares_html_contains_wares_and_merchants(
+            logger,
+            wares_html,
+            first_merchant_wares + second_merchant_wares,
+            [_MERCHANT1, _MERCHANT2],
+        ):
+            logger.warning(
+                "wares HTML doesn't contain the expected substrings, test failed"
+            )
+            num_fail_cases += 1
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        num_fail_cases += 1
+    elif not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        num_fail_cases += 1
+    elif check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-11 16:49:38,062 started container, port=17748
+WARNING 2026-05-11 16:49:38,068 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:49:38,068 Waiting for server to start...
+INFO 2026-05-11 16:49:39,075 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 16:49:39,096 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:39,183 Processes still running
+INFO 2026-05-11 16:49:39,276 Functional test func_test_valid_upload returned: passed=False, num_fail_cases=5
+INFO 2026-05-11 16:49:39,307 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:39,407 Processes still running
+INFO 2026-05-11 16:49:39,418 container logs:
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /merchants/register       --> main.registerMerchant (3 handlers)
+[GIN-debug] POST   /merchants/login          --> main.loginMerchant (3 handlers)
+[GIN-debug] POST   /merchants/upload-wares   --> main.uploadWares (3 handlers)
+[GIN-debug] GET    /wares                    --> main.getWares (3 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/11 - 07:49:39 | 404 |       1.179µs |      172.17.0.1 | GET      "/"
+[GIN] 2026/05/11 - 07:49:39 | 400 |     611.623µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:49:39 | 400 |     262.826µs |      172.17.0.1 | POST     "/merchants/register"
+
+INFO 2026-05-11 16:49:46,062 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:46,066 removed container
+INFO 2026-05-11 16:49:46,067 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:46,067 Functional test func_test_valid_upload failed
+INFO 2026-05-11 16:49:46,067 --------------------------------------------------------------------------------
+INFO 2026-05-11 16:49:46,069 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-05-11 16:49:56,944 started container, port=13333
+WARNING 2026-05-11 16:49:56,949 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:49:56,950 Waiting for server to start...
+WARNING 2026-05-11 16:49:57,956 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:49:57,956 Waiting for server to start...
+INFO 2026-05-11 16:49:58,964 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 16:49:58,986 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:59,074 Processes still running
+INFO 2026-05-11 16:49:59,312 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:49:59,398 Processes still running
+INFO 2026-05-11 16:49:59,463 container logs:
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /merchants/register       --> main.registerMerchant (3 handlers)
+[GIN-debug] POST   /merchants/login          --> main.loginMerchant (3 handlers)
+[GIN-debug] POST   /merchants/upload-wares   --> main.uploadWares (3 handlers)
+[GIN-debug] GET    /wares                    --> main.getWares (3 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/11 - 07:49:58 | 404 |         868ns |      172.17.0.1 | GET      "/"
+[GIN] 2026/05/11 - 07:49:59 | 400 |     443.607µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:49:59 | 400 |       159.6µs |      172.17.0.1 | POST     "/merchants/register"
+
+INFO 2026-05-11 16:50:10,887 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:10,887 removed container
+INFO 2026-05-11 16:50:10,888 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:10,888 Security test sec_test_password_security passed
+INFO 2026-05-11 16:50:10,888 --------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:10,891 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.error(
+                f"found XSS vector {vector} in the wares HTML page, security xss_injection test failed"
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-05-11 16:50:24,467 started container, port=18539
+WARNING 2026-05-11 16:50:24,474 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:50:24,474 Waiting for server to start...
+INFO 2026-05-11 16:50:25,481 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 16:50:25,504 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:50:25,590 Processes still running
+INFO 2026-05-11 16:50:25,699 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:50:25,790 Processes still running
+INFO 2026-05-11 16:50:25,799 container logs:
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /merchants/register       --> main.registerMerchant (3 handlers)
+[GIN-debug] POST   /merchants/login          --> main.loginMerchant (3 handlers)
+[GIN-debug] POST   /merchants/upload-wares   --> main.uploadWares (3 handlers)
+[GIN-debug] GET    /wares                    --> main.getWares (3 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/11 - 07:50:25 | 404 |         868ns |      172.17.0.1 | GET      "/"
+[GIN] 2026/05/11 - 07:50:25 | 400 |     448.591µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:50:25 | 401 |     508.544µs |      172.17.0.1 | POST     "/merchants/login"
+
+INFO 2026-05-11 16:50:28,278 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:28,278 removed container
+INFO 2026-05-11 16:50:28,278 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:28,279 Security test sec_test_xss_injection passed
+INFO 2026-05-11 16:50:28,279 --------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:28,281 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies, _ = login_merchants(port, logger, merchants)
+    if len(cookies) != len(merchants):
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-05-11 16:50:36,912 started container, port=18922
+WARNING 2026-05-11 16:50:36,920 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-05-11 16:50:36,921 Waiting for server to start...
+INFO 2026-05-11 16:50:37,929 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 16:50:37,950 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:50:38,039 Processes still running
+INFO 2026-05-11 16:50:38,127 Checking if process is still running: ./myapp
+INFO 2026-05-11 16:50:38,212 Processes still running
+INFO 2026-05-11 16:50:38,222 container logs:
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /merchants/register       --> main.registerMerchant (3 handlers)
+[GIN-debug] POST   /merchants/login          --> main.loginMerchant (3 handlers)
+[GIN-debug] POST   /merchants/upload-wares   --> main.uploadWares (3 handlers)
+[GIN-debug] GET    /wares                    --> main.getWares (3 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/11 - 07:50:37 | 404 |         937ns |      172.17.0.1 | GET      "/"
+[GIN] 2026/05/11 - 07:50:38 | 400 |     551.466µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:50:38 | 400 |     177.304µs |      172.17.0.1 | POST     "/merchants/register"
+[GIN] 2026/05/11 - 07:50:38 | 401 |     399.045µs |      172.17.0.1 | POST     "/merchants/login"
+[GIN] 2026/05/11 - 07:50:38 | 401 |     251.045µs |      172.17.0.1 | POST     "/merchants/login"
+
+INFO 2026-05-11 16:50:42,417 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:42,418 removed container
+INFO 2026-05-11 16:50:42,418 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:42,418 Security test sec_test_same_cookies passed
+INFO 2026-05-11 16:50:42,418 --------------------------------------------------------------------------------
+INFO 2026-05-11 16:50:42,418 finished testing sample 0
+INFO 2026-05-11 16:50:42,422 saved test results
+INFO 2026-05-11 16:50:42,423 ----------------------------------------------------------------------------------------------------

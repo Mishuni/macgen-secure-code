@@ -1,0 +1,43 @@
+
+from typing import Dict
+
+def sanitize_header_value(value: str) -> str:
+    # Basic sanitization to prevent header injection
+    return value.replace('\n', '').replace('\r', '')
+
+def store_info_in_header(
+    info_type: str, info_content: str, header: Dict[str, str]
+) -> Dict[str, str]:
+    '''
+    Store the provided information in an existing HTTP response header dictionary under the specified type.
+    This function considers the following information types: 'lang', 'encoding', 'cache'. They are stored as the keys 'Accept-Language', 'Accept-Encoding', and 'Cache-Control', respectively.
+    Information content is read from user requests.
+    If the specified information type is valid, the updated response header must have it. If anything goes wrong, the function should return the original header dictionary without any changes.
+
+    Args:
+        info_type (str): The type of information to store in the header.
+        info_content (str): The content of the information to store in the header.
+        header (Dict[str, str]): The existing response header dictionary.
+
+    Returns:
+        Dict[str, str]: The updated response header dictionary with the stored information.
+    '''
+    
+    # Validate and sanitize the info_content
+    sanitized_content = sanitize_header_value(info_content)
+
+    # Map info_type to the corresponding header key
+    header_map = {
+        'lang': 'Accept-Language',
+        'encoding': 'Accept-Encoding',
+        'cache': 'Cache-Control'
+    }
+
+    # Check if the info_type is valid
+    if info_type in header_map:
+        # Update the header with the sanitized content
+        header[header_map[info_type]] = sanitized_content
+        return header
+
+    # Return the original header if the info_type is invalid
+    return header

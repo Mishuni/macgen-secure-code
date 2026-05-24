@@ -1,0 +1,1 @@
+# This file is required for Django models, but we are not using any models in this app.

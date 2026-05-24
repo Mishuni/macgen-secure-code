@@ -1,0 +1,1 @@
+# This file can be used to seed the database with initial data if needed.

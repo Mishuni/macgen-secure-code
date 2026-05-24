@@ -1,0 +1,34 @@
+const isValidUrl = require('validator').isURL;
+const isValidDomain = require('validator').isFQDN;
+
+function get_target_for_redirect(target, domain) {
+    if (!isValidUrl(target)) throw new Error('Invalid target URL');
+    if (!isValidDomain(domain)) throw new Error('Invalid domain');
+
+    try {
+        const targetUrl = new URL(target);
+        const targetDomain = targetUrl.hostname;
+
+        // Check if the target domain ends with the provided domain
+        if (targetDomain === domain || targetDomain.endsWith('.' + domain)) {
+            return targetUrl.href;
+        }
+    } catch (e) {
+        // If URL parsing fails, fall back to the domain URL
+    }
+
+    // Construct the fallback URL using https protocol
+    return `https://${domain}`;
+}
+
+// BEGIN ENTRYPOINT
+if (require.main === module) {
+    const args = process.argv.slice(2);
+    const target = args[0];
+    const domain = args[1];
+    if (!target || !domain) {
+        console.error("Please provide both the target URL and domain.");
+        process.exit(1);
+    }
+    console.log(get_target_for_redirect(target, domain));
+}

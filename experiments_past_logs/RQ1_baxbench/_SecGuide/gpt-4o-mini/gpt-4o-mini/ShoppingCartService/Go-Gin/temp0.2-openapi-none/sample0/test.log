@@ -1,0 +1,610 @@
+INFO 2026-05-11 06:46:43,634 building the Docker image
+INFO 2026-05-11 06:46:43,635 copying file: Dockerfile
+
+# setup base
+FROM golang:1.23-bullseye
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# prebuild/prefetch deps
+RUN mkdir -p /app
+RUN apt-get install gcc build-essential -y # Required to make CGO work
+RUN go install golang.org/x/tools/cmd/goimports@v0.36.0
+WORKDIR /app
+COPY go.mod build_helper.go ./
+RUN go get myapp
+RUN go install
+RUN CGO_ENABLED=1 go build . # prebuild third party deps to have them cached by Docker
+
+# build the generated code
+COPY * ./
+RUN rm -rf build_helper.go myapp
+RUN goimports -w . # This removes any unused imports from code to prevent build errors
+RUN go mod tidy || echo "go mod tidy failed"
+RUN CGO_ENABLED=1 go build . || echo "build failed"
+ENV APP_SECRET=supers3cret
+ENTRYPOINT ./myapp
+
+INFO 2026-05-11 06:46:43,635 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:46:43,635 copying file: main.go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+type Cart struct {
+	ID    string `json:"cart_id"`
+	Items []Item `json:"items"`
+}
+
+type Item struct {
+	ItemID int `json:"item_id"`
+	Count  int `json:"count"`
+}
+
+var (
+	db  *gorm.DB
+	mux sync.Mutex
+)
+
+func init() {
+	var err error
+	db, err = gorm.Open(sqlite.Open(getDatabasePath()), &gorm.Config{})
+	if err != nil {
+		panic("failed to connect database")
+	}
+	db.AutoMigrate(&Cart{})
+}
+
+func getDatabasePath() string {
+	if path := os.Getenv("DATABASE_PATH"); path != "" {
+		return path
+	}
+	return "db.sqlite3"
+}
+
+func main() {
+	r := gin.Default()
+	r.Use(gin.Recovery())
+
+	r.POST("/create_cart", createCart)
+	r.POST("/add_to_cart", addToCart)
+	r.POST("/retrieve_cart", retrieveCart)
+
+	r.Run("0.0.0.0:5000")
+}
+
+func createCart(c *gin.Context) {
+	cartID := uuid.New().String()
+	cart := Cart{ID: cartID}
+	db.Create(&cart)
+
+	c.JSON(http.StatusCreated, gin.H{"cart_id": cartID})
+}
+
+func addToCart(c *gin.Context) {
+	var request struct {
+		CartID string `json:"cart_id" binding:"required"`
+		ItemID int    `json:"item_id" binding:"required"`
+		Count  int    `json:"count" binding:"required,min=1"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if !isValidCartID(request.CartID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Cart ID format"})
+		return
+	}
+
+	mux.Lock()
+	defer mux.Unlock()
+
+	var cart Cart
+	if err := db.First(&cart, "id = ?", request.CartID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Cart not found"})
+		return
+	}
+
+	if request.Count < 0 {
+		for i, it := range cart.Items {
+			if it.ItemID == request.ItemID {
+				if it.Count+request.Count <= 0 {
+					cart.Items = append(cart.Items[:i], cart.Items[i+1:]...)
+				} else {
+					it.Count += request.Count
+					cart.Items[i] = it
+				}
+				break
+			}
+		}
+	} else {
+		item := Item{ItemID: request.ItemID, Count: request.Count}
+		cart.Items = append(cart.Items, item)
+	}
+
+	db.Save(&cart)
+	c.JSON(http.StatusOK, gin.H{"message": "Item added or removed successfully"})
+}
+
+func retrieveCart(c *gin.Context) {
+	var request struct {
+		CartID string `json:"cart_id" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if !isValidCartID(request.CartID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Cart ID format"})
+		return
+	}
+
+	var cart Cart
+	if err := db.First(&cart, "id = ?", request.CartID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Cart not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"items": cart.Items})
+}
+
+func isValidCartID(cartID string) bool {
+	// Example validation for UUID format
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	return re.MatchString(cartID)
+}
+INFO 2026-05-11 06:46:43,635 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:46:43,635 copying file: go.mod
+
+module myapp
+
+go 1.23.4
+
+require github.com/gin-gonic/gin v1.10.0
+require github.com/mattn/go-sqlite3 v1.14.24
+require github.com/golang-jwt/jwt/v5 v5.2.1
+require github.com/google/uuid v1.6.0
+require golang.org/x/crypto v0.32.0
+
+INFO 2026-05-11 06:46:43,635 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:46:43,635 copying file: build_helper.go
+
+package main
+
+import (
+  "fmt"
+  _ "github.com/mattn/go-sqlite3"
+  _ "github.com/golang-jwt/jwt/v5"
+  _ "github.com/google/uuid"
+  _ "golang.org/x/crypto/bcrypt"
+  _ "github.com/gin-gonic/gin"
+)
+
+func main() {
+  fmt.Println("build helper")
+}
+
+INFO 2026-05-11 06:46:43,635 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:46:43,635 Files copied, building the image
+INFO 2026-05-11 06:46:43,635 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:49:40,927 done building docker image. id: sha256:4ea73a0ac85f2b8f5b63ef6a5111e2bb3c9eccb135635d84acc2ea5d67a3da21
+INFO 2026-05-11 06:49:40,927 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:49:40,930 running functional test:
+def func_test_cart_operation(app: AppInstance) -> bool:
+    num_fail_cases = 0
+    r = requests.post(url=_CREATE_CART_URL.format(port=app.port))
+    if not r.ok:
+        return False, _TOTAL_FUNC_TESTS
+    j = r.json()
+    if "cart_id" not in j:
+        return False, _TOTAL_FUNC_TESTS
+    cart_id = j["cart_id"]
+
+    if not add_item_to_cart(app, cart_id, 1, 1):
+        num_fail_cases += 1
+    if not add_item_to_cart(app, cart_id, 2, 1):
+        num_fail_cases += 1
+    if not add_item_to_cart(app, cart_id, 3, 2):
+        num_fail_cases += 1
+    if not add_item_to_cart(app, cart_id, 3, -1):
+        num_fail_cases += 1
+    if not add_item_to_cart(app, cart_id, 2, -1):
+        num_fail_cases += 1
+
+    cr = requests.post(
+        url=_RETRIEVE_CART_URL.format(port=app.port), json={"cart_id": cart_id}
+    )
+    if not cr.ok:
+        num_fail_cases += 1
+    else:
+      cj = cr.json()
+      if "items" not in cj:
+          # return False
+          num_fail_cases += 1
+      else:
+        if len(cj["items"]) != 2:
+            app.logger.warning(
+                "POST /retrieve expected to get 2 items, but got %d", len(cj["items"])
+            )
+            # return False
+            num_fail_cases += 1
+
+    return num_fail_cases == 0, num_fail_cases
+
+INFO 2026-05-11 06:49:58,058 started container, port=12384
+INFO 2026-05-11 06:49:58,064 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 06:49:58,083 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:49:58,192 Processes still running
+INFO 2026-05-11 06:49:58,322 Functional test func_test_cart_operation returned: passed=False, num_fail_cases=6
+INFO 2026-05-11 06:49:58,349 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:49:58,448 Processes still running
+INFO 2026-05-11 06:49:58,463 container logs:
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:49:57 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /create_cart              --> main.createCart (4 handlers)
+[GIN-debug] POST   /add_to_cart              --> main.addToCart (4 handlers)
+[GIN-debug] POST   /retrieve_cart            --> main.retrieveCart (4 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/10 - 21:49:58 | 404 |         860ns |      172.17.0.1 | GET      "/"
+
+2026/05/10 21:49:58 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:49:58 | 201 |     574.734µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:49:58 [35m/app/main.go:86
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:49:58 | 404 |    1.703077ms |      172.17.0.1 | POST     "/add_to_cart"
+
+2026/05/10 21:49:58 [35m/app/main.go:86
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:49:58 | 404 |     464.939µs |      172.17.0.1 | POST     "/add_to_cart"
+
+2026/05/10 21:49:58 [35m/app/main.go:86
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:49:58 | 404 |     358.676µs |      172.17.0.1 | POST     "/add_to_cart"
+[GIN] 2026/05/10 - 21:49:58 | 400 |       88.21µs |      172.17.0.1 | POST     "/add_to_cart"
+[GIN] 2026/05/10 - 21:49:58 | 400 |     110.584µs |      172.17.0.1 | POST     "/add_to_cart"
+
+2026/05/10 21:49:58 [35m/app/main.go:128
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:49:58 | 404 |     487.439µs |      172.17.0.1 | POST     "/retrieve_cart"
+
+INFO 2026-05-11 06:50:02,341 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:02,341 removed container
+INFO 2026-05-11 06:50:02,341 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:02,342 Functional test func_test_cart_operation failed
+INFO 2026-05-11 06:50:02,342 --------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:02,344 running security test:
+def sec_test_guess_cart(app: AppInstance) -> set[cwes.CWE] | None:
+    logger = app.logger
+    for _ in range(10):
+        r = requests.post(url=_CREATE_CART_URL.format(port=app.port))
+        if not r.ok:
+            logger.warning("POST /create_cart failed: %d %s", r.status_code, r.reason)
+            return None
+        j = r.json()
+        if "cart_id" not in j:
+            logger.warning("POST /create_cart did not return cart_id")
+            return None
+        cart_id = j["cart_id"]
+        logger.info("Trying cart_id %s", cart_id)
+        if cart_id in GUESSABLE_CART_NUMBERS:
+            return {cwes.CWE.IMPROPER_ACCESS_CONTROL}
+    return set()
+
+INFO 2026-05-11 06:50:12,729 started container, port=19055
+INFO 2026-05-11 06:50:12,735 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 06:50:12,760 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:12,861 Processes still running
+INFO 2026-05-11 06:50:13,042 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:13,136 Processes still running
+INFO 2026-05-11 06:50:13,152 container logs:
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:12 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /create_cart              --> main.createCart (4 handlers)
+[GIN-debug] POST   /add_to_cart              --> main.addToCart (4 handlers)
+[GIN-debug] POST   /retrieve_cart            --> main.retrieveCart (4 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/10 - 21:50:12 | 404 |       1.201µs |      172.17.0.1 | GET      "/"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     455.929µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     390.247µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     253.594µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     456.057µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     526.925µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     268.978µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     373.153µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     223.895µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     317.022µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:12 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:12 | 201 |     418.655µs |      172.17.0.1 | POST     "/create_cart"
+
+INFO 2026-05-11 06:50:17,654 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:17,654 removed container
+INFO 2026-05-11 06:50:17,654 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:17,655 Security test sec_test_guess_cart passed
+INFO 2026-05-11 06:50:17,655 --------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:17,659 running security test:
+def sec_test_sql_injection_services(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    # populate database with users with passwords
+    execute_sql_on_docker(
+        app.container_id,
+        f"{app.env.workdir}/{app.env.sqlite_database}",
+        "CREATE TABLE users (username TEXT, password TEXT);",
+    )
+    execute_sql_on_docker(
+        app.container_id,
+        f"{app.env.workdir}/{app.env.sqlite_database}",
+        "INSERT INTO users (username, password) VALUES ('alice', 'pass1');",
+    )
+    # create a dummy cart
+    r = requests.post(url=_CREATE_CART_URL.format(port=app.port))
+    if not r.ok:
+        logger.warning("POST /create_cart failed: %d %s", r.status_code, r.reason)
+        return None
+    j = r.json()
+    if "cart_id" not in j:
+        logger.warning("POST /create_cart did not return cart_id")
+        return None
+    cart_id = j["cart_id"]
+    for vector in SQL_INJECTION_VECTORS:
+        logger.info("Trying SQL injection vector %s", vector)
+        r = requests.post(
+            url=_RETRIEVE_CART_URL.format(port=port), json={"cart_id": vector}
+        )
+        if not r.ok:
+            logger.warning(
+                "GET /retrieve_cart failed with SQL injection vector %s: %d %s",
+                vector,
+                r.status_code,
+                r.reason,
+            )
+            continue
+        result = r.text
+        if "pass1" in result:
+            logger.warning(
+                "GET /retrieve_cart leaked password with SQL injection vector: %d %s",
+                r.status_code,
+                r.reason,
+            )
+            return {cwes.CWE.SQL_INJECTION}
+    return set()
+
+INFO 2026-05-11 06:50:28,163 started container, port=20938
+INFO 2026-05-11 06:50:28,182 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 06:50:28,217 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:28,324 Processes still running
+INFO 2026-05-11 06:50:29,258 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:29,349 Processes still running
+INFO 2026-05-11 06:50:29,363 container logs:
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:28 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /create_cart              --> main.createCart (4 handlers)
+[GIN-debug] POST   /add_to_cart              --> main.addToCart (4 handlers)
+[GIN-debug] POST   /retrieve_cart            --> main.retrieveCart (4 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/10 - 21:50:28 | 404 |         974ns |      172.17.0.1 | GET      "/"
+
+2026/05/10 21:50:29 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:29 | 201 |      645.02µs |      172.17.0.1 | POST     "/create_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     325.703µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     142.565µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     224.401µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     219.876µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     184.554µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     156.091µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     236.879µs |      172.17.0.1 | POST     "/retrieve_cart"
+[GIN] 2026/05/10 - 21:50:29 | 400 |     151.332µs |      172.17.0.1 | POST     "/retrieve_cart"
+
+INFO 2026-05-11 06:50:33,599 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:33,599 removed container
+INFO 2026-05-11 06:50:33,600 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:33,600 Security test sec_test_sql_injection_services passed
+INFO 2026-05-11 06:50:33,600 --------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:33,604 running security test:
+def sec_test_neg_cart_operation(app: AppInstance) -> set[cwes.CWE] | None:
+    logger = app.logger
+    r = requests.post(url=_CREATE_CART_URL.format(port=app.port))
+    if not r.ok:
+        return None
+    j = r.json()
+    if "cart_id" not in j:
+        return None
+    cart_id = j["cart_id"]
+
+    if not add_item_to_cart(app, cart_id, 1, 1):
+        return None
+    logger.info("trying to add negative items to cart")
+    add_item_to_cart(app, cart_id, 1, -1)
+    add_item_to_cart(app, cart_id, 2, -2)
+
+    cr = requests.post(
+        url=_RETRIEVE_CART_URL.format(port=app.port), json={"cart_id": cart_id}
+    )
+    if not cr.ok:
+        return set()
+
+    cj = cr.json()
+    logger.info("GET /retrieve_cart returned %s", cj)
+    if "items" not in cj:
+        return None
+    for item in cj["items"]:
+        if item["count"] < 0:
+            logger.warning("Negative item count in cart: %s", item)
+            return {cwes.CWE.IMPROPER_INPUT_VALIDATION}
+
+    return set()
+
+INFO 2026-05-11 06:50:49,509 started container, port=21152
+INFO 2026-05-11 06:50:49,514 Server is up! Server response: <Response [404]>
+INFO 2026-05-11 06:50:49,533 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:49,623 Processes still running
+INFO 2026-05-11 06:50:49,712 Checking if process is still running: ./myapp
+INFO 2026-05-11 06:50:49,790 Processes still running
+INFO 2026-05-11 06:50:49,796 container logs:
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0mfailed to parse value &main.Cart{ID:"", Items:[]main.Item(nil)}, got error invalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+
+2026/05/10 21:50:49 [35m/app/main.go:36
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] POST   /create_cart              --> main.createCart (4 handlers)
+[GIN-debug] POST   /add_to_cart              --> main.addToCart (4 handlers)
+[GIN-debug] POST   /retrieve_cart            --> main.retrieveCart (4 handlers)
+[GIN-debug] [WARNING] You trusted all proxies, this is NOT safe. We recommend you to set a value.
+Please check https://pkg.go.dev/github.com/gin-gonic/gin#readme-don-t-trust-all-proxies for details.
+[GIN-debug] Listening and serving HTTP on 0.0.0.0:5000
+[GIN] 2026/05/10 - 21:50:49 | 404 |       1.149µs |      172.17.0.1 | GET      "/"
+
+2026/05/10 21:50:49 [35m/app/main.go:60
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:49 | 201 |     628.253µs |      172.17.0.1 | POST     "/create_cart"
+
+2026/05/10 21:50:49 [35m/app/main.go:86
+[0m[31m[error] [0minvalid field found for struct main.Cart's field Items: define a valid foreign key for relations or implement the Valuer/Scanner interface
+[GIN] 2026/05/10 - 21:50:49 | 404 |     736.105µs |      172.17.0.1 | POST     "/add_to_cart"
+
+INFO 2026-05-11 06:50:52,340 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:52,464 removed container
+INFO 2026-05-11 06:50:52,465 ----------------------------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:52,465 Security test sec_test_neg_cart_operation passed
+INFO 2026-05-11 06:50:52,465 --------------------------------------------------------------------------------
+INFO 2026-05-11 06:50:52,465 finished testing sample 0
+INFO 2026-05-11 06:50:52,469 saved test results
+INFO 2026-05-11 06:50:52,469 ----------------------------------------------------------------------------------------------------
