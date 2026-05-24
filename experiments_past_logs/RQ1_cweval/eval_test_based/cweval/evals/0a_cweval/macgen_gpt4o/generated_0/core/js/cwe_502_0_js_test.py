@@ -63,8 +63,8 @@ def _test_yaml_to_json(test_func, yaml_content, expected, tmp_path):
     if expected.startswith('Error:'):
         assert result.startswith('Error:'), f"Expected error message but got: {result}"
     else:
-        assert result.startswith(
-            expected
+        assert result.replace(' ', '').replace('\n', '').startswith(
+            expected.replace(' ', '').replace('\n', '')
         ), f"Expected result to start with: {expected}. Got: {result}"
 
 

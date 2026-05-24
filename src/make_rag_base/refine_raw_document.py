@@ -276,6 +276,6 @@ if __name__ == "__main__":
 
 #     python refine_raw_document.py \
 #   --dedup_only \
-#   --input  data/refined_raw_documents/CERT_C_faiss/CERT_C_refined.json \
-#   --output data/refined_raw_documents/CERT_C_faiss/CERT_C_deduped.json \
+#   --input  data/rag_databases/CERT_C_faiss/CERT_C_refined.json \
+#   --output data/rag_databases/CERT_C_faiss/CERT_C_deduped.json \
 #   --dedup_threshold 0.75
