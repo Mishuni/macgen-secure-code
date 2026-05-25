@@ -394,7 +394,7 @@ Output format (or "No additional guideline needed." if none apply):
 # SECURITY AGENT : CWEs Extraction Prompts
 # =============================
 SEC_AGENT_SYSTEM = (
-    "You are a senior security engineer."
+    "You are a security engineer."
     "Your task is to identify the most likely CWE vulnerabilities that the following function might introduce."
 )
 
@@ -536,7 +536,7 @@ Context:
 {prompt_4_sec_tail}"""),
 ])
 
-prompt_4_sec_tail = """Output format:.
+prompt_4_sec_tail = """Output format:
 ### security guidelines
 - Provide 1-{cwe_limit} clear guidelines that leave no room for error. (if needed, with at most one minimal code line as an example).
 - Keep it precise; no fluff, no generic advice.
@@ -635,7 +635,7 @@ prompt_4_code = ChatPromptTemplate.from_messages([
 ])
 
 code_gen_prompt = [ChatPromptTemplate.from_template(
-    """Your task is to write secure and functional code **for the following problem** in {language}.
+    """Your task is to write secure and functional code for the following problem in {language}.
 ### Problem Statement:
 {task_description}
 
@@ -943,7 +943,7 @@ Step-by-step explanation of functional logic and security mechanisms.
 
 # === Default (non-baxbench) phase2 variants ===
 fix_suggestion_after = ChatPromptTemplate.from_template(
-    """You are a senior software engineer. Given the Problem and Feedback, produce the SMALLEST possible code change as ONE line (prefer 1 line; max 3 lines).
+    """You are a software engineer. Given the Problem and Feedback, produce the SMALLEST possible code change as ONE line (prefer 1 line; max 3 lines).
 First, think step-by-step about the root cause and the minimal fix.
 
 Constraints:
@@ -979,7 +979,7 @@ Rules:
 )
 
 sec_understand_prompt = ChatPromptTemplate.from_template(
-    """You are a security engineer. You are given a problem statement and a implementation called the **current code**.
+    """You are a security engineer. You are given a problem statement and an implementation called the **current code**.
 Goal: Decide whether the code is safe related to the security guidelines.
 Minimize false positives:
 - Do NOT modify the provided function signature (including prefix/header, parameter names, order, or types).
@@ -1002,7 +1002,7 @@ Output format:
 ### Current Code Analysis
 Step-by-step explanation of logic and security mechanisms
 ### Final Opinion
-- Provide your overall assessment of the current code’s **security concerns**.
+- Provide your overall assessment of the current code’s security concerns.
 - If you find no issue, output ONLY the ‘THE CODE IS SAFE’.
 """)
 
