@@ -19,7 +19,7 @@ class RAGManager:
         "cpp": ["data/rag_databases/CERT_CPP_faiss/faiss_index"], 
         "python": ["data/rag_databases/Python_faiss/faiss_index", "data/rag_databases/ASVS_faiss"],  
         "py": ["data/rag_databases/Python_faiss/faiss_index", "data/rag_databases/ASVS_faiss"],  
-        "javascript": ["data/rag_databases/JavaScript_faiss/faiss_index","data/rag_databases/OWASP_CheatSheets_faiss/faiss_index","data/rag_databases/ASVS_faiss" ],
+        "javascript": ["data/rag_databases/OWASP_CheatSheets_faiss/faiss_index" ],
         "go": [ "data/rag_databases/Go_faiss/faiss_index", "data/rag_databases/ASVS_faiss"],  
         "rust": [ "data/rag_databases/ASVS_faiss"],
         "php": [ "data/rag_databases/ASVS_faiss"],

@@ -98,15 +98,6 @@ def extract_text(doc: Dict[str, Any]) -> str:
     # last resort: stringify
     return json.dumps(doc, ensure_ascii=False)
 
-# def extract_cwe_header(full_text: str) -> Optional[str]:
-#     m = CWE_HEADER_RE.search(full_text)
-#     if not m:
-#         return None
-#     cwe_id = m.group(1).strip()
-#     name = m.group(2).strip()
-#     # normalize
-#     name = re.sub(r"\s+", " ", name)
-#     return f"{cwe_id}: {name}"
 
 def normalize_lines(text: str) -> List[str]:
     # Keep code lines too; your prompt will decide whether to output EXAMPLE or nothing.
@@ -165,12 +156,6 @@ def build_guideline_block(
                 continue
             # seen.add(el)
             out_lines.append(el)
-            # Avoid accidentally repeating the header elsewhere; we already force it to the top.
-            # if el.startswith("CWE-"):
-            #     continue
-            # if el not in seen:
-            #     out_lines.append(el)
-            #     seen.add(el)
 
         # if sleep_s > 0:
         #     time.sleep(sleep_s)
@@ -274,8 +259,13 @@ def main():
 if __name__ == "__main__":
     main()
 
-#     python refine_raw_document.py \
+#    python refine_raw_document.py \
 #   --dedup_only \
-#   --input  data/rag_databases/CERT_C_faiss/CERT_C_refined.json \
-#   --output data/rag_databases/CERT_C_faiss/CERT_C_deduped.json \
+#   --input  data/refined_raw_documents/CERT_C_faiss/CERT_C.json \
+#   --output data/refined_raw_documents/CERT_C_faiss/CERT_C_refined.json \
 #   --dedup_threshold 0.75
+
+
+#    python refine_raw_document.py \
+#   --input  data/refined_raw_documents_v4/OWASP_CheatSheets_faiss/owasp_cheatsheet_docs.json \
+#   --output data/refined_raw_documents_v4/OWASP_CheatSheets_faiss/owasp_cheatsheet_docs_refined.json \
