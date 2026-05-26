@@ -538,7 +538,7 @@ Context:
 
 prompt_4_sec_tail = """Output format:
 ### security guidelines
-- Provide 1-{cwe_limit} clear guidelines that leave no room for error. (if needed, with at most one minimal code line as an example).
+- Provide 1-3 clear guidelines that leave no room for error. (if needed, with at most one minimal code line as an example).
 - Keep it precise; no fluff, no generic advice.
 - Preserving functionality.
 - Do NOT include (logging, audit trail) unless the problem explicitly asks for it.
