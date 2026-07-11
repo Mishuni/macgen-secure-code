@@ -205,5 +205,40 @@ All experiment logs and precomputed outputs are archived under `experiments_past
 This includes runs for CWEval, BaxBench and model variants (`gpt4o`,`gpt4o-mini`, `deepseek-r1_70b`, `gemini-2.5-flash`,`gemini-2.5-flash-lite`, `qwen3_8b`).
 
 ---
+## 🧾 Model & API Versions
+
+Exact model identifiers and library versions used to produce the results reported in the paper, for reproducibility.
+
+### Model snapshots
+
+| Alias (`--model`) | Resolved model ID | Provider |
+|:---|:---|:---|
+| `gpt4o` | `gpt-4o` | OpenAI |
+| `gpt4o-mini` / `gpt-4o-mini` | `gpt-4o-mini-2024-07-18` | OpenAI |
+| `gpt5.1` / `gpt-5.1` | `gpt-5.1` | OpenAI |
+| `gemini-2.5-flash` | `gemini-2.5-flash` | Google |
+| `gemini-2.5-flash-lite` | `gemini-2.5-flash-lite` | Google |
+| `qwen3_8b` | `qwen3:8b` (Ollama tag) | Ollama (local) |
+| `deepseek-r1_70b` | `deepseek-r1:70b` (Ollama tag) | Ollama (local) |
+| `claude-sonnet-5` | `claude-sonnet-5` | Anthropic |
+
+### API / library versions
+
+Versions of the environment that produced the reported results (conda env `indict`):
+
+| Package | Version |
+|:---|:---|
+| `openai` (Python SDK) | 1.109.1 |
+| `anthropic` (Python SDK) | 0.84.0 |
+| Ollama (server) | 0.12.10 |
+| `google-generativeai` | 0.8.5 |
+| `langchain` / `langchain-core` | 0.3.0 / 0.3.49 |
+| `langchain-openai` | 0.2.1 |
+| `langchain-anthropic` | 0.3.22 |
+| `faiss-cpu` | 1.11.0 |
+
+`requirements.txt` will be synced to these exact versions before the camera-ready release.
+
+---
 ## 📜 License
 Licensed under the [MIT License](LICENSE).
