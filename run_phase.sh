@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 # ===== Default values =====
-MODEL=""   # Available: gpt4o-mini, deepseek-r1_70b, gemini-2.5-flash-lite, gemini-2.5-flash, qwen3_8b
-TASK=""    # Task: llmseceval | cweval | humaneval | baxbench
+MODEL=""   # Required. Available: gpt4o, gpt4o-mini, gpt5.1, gemini-2.5-flash-lite, gemini-2.5-flash, qwen3_8b, deepseek-r1_70b, claude-sonnet-5
+TASK=""    # Required. Task: llmseceval | cweval | humaneval | baxbench
 BENCHMARK="instruct" # instruct | autocomplete
 
 BASE_DIR="experiments"
@@ -23,8 +23,8 @@ usage() {
 Usage: ./run_phase.sh [options]
 
 Options:
-  --model <name>       (default: gpt4o-mini)
-  --task <name>        (default: llmseceval) [cweval, llmseceval, humaneval, baxbench]
+  --model <name>       (required) [gpt4o, gpt4o-mini, gpt5.1, gemini-2.5-flash-lite, gemini-2.5-flash, qwen3_8b, deepseek-r1_70b, claude-sonnet-5]
+  --task <name>        (required) [cweval, llmseceval, humaneval, baxbench]
   --benchmark <name>   (default: instruct)
   --base-dir <path>    (default: experiments)
   --pj-name <name>     (no default; empty → TASK_MODEL_macgen)
@@ -57,6 +57,13 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unexpected option: $1"; usage; exit 1;;
   esac
 done
+
+# ------- Validate required options -------
+if [[ -z "$MODEL" || -z "$TASK" ]]; then
+  echo "ERROR: --model and --task are required." >&2
+  usage
+  exit 1
+fi
 
 # ------- Model Mapping (aliases) -------
 case "$MODEL" in
@@ -184,13 +191,21 @@ elif [[ "$TASK" == *llmseceval* ]]; then
 
 elif [[ "$TASK" == *baxbench* ]]; then
   echo "== [BaxBench] Evaluation =="
+  if ! python -c "import docker" >/dev/null 2>&1; then
+    echo "ERROR: the 'docker' Python package (and BaxBench's other deps) are not installed" \
+         "in the current environment." >&2
+    echo "BaxBench requires its own dependencies (see baxbench/requirements.txt or" \
+         "baxbench/README.md's pipenv setup) separate from the main MACGen requirements.txt." >&2
+    echo "Install them (e.g. 'pip install -r baxbench/requirements.txt') and re-run." >&2
+    exit 1
+  fi
   (
     cd "${REPO_ROOT}/baxbench/src"
-    python main.py --n_samples 1 --model "$BAXBENCH_MODEL" \
+    python main.py --n_samples 1 --models "$BAXBENCH_MODEL" \
       --results_dir "${REPO_ROOT}/${EXP_DIR}" --mode extract ${INIT_FLAG:+$INIT_FLAG}
-    python main.py --n_samples 1 --model "$BAXBENCH_MODEL" \
+    python main.py --n_samples 1 --models "$BAXBENCH_MODEL" \
       --results_dir "${REPO_ROOT}/${EXP_DIR}" --mode test ${INIT_FLAG:+$INIT_FLAG}
-    python main.py --n_samples 1 --model "$BAXBENCH_MODEL" \
+    python main.py --n_samples 1 --models "$BAXBENCH_MODEL" \
       --results_dir "${REPO_ROOT}/${EXP_DIR}" --mode evaluate ${INIT_FLAG:+$INIT_FLAG}
   )
 fi

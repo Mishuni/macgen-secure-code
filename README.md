@@ -1,10 +1,12 @@
-# ACL ARR 2026 May Submission #9873
+# MACGen: Toward Functionally Correct and Secure Code Generation via Multi-Agent Collaboration
 
-## MACGen: Toward Functionally Correct and Secure Code Generation via Multi-Agent Collaboration
+[![arXiv](https://img.shields.io/badge/arXiv-<ARXIV_ID>-b31b1b.svg)](https://arxiv.org/abs/2608.25457)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> This repository contains the implementation and resources  
-> for the paper submitted to **ACL ARR 2026 May**. <br>
-> **Submission Number:** 
+Official implementation of
+[**MACGen: Toward Functionally Correct and Secure Code Generation via Multi-Agent Collaboration**](https://arxiv.org/abs/2608.25457).
+
+MACGen is a multi-agent code-generation framework designed to improve the functional correctness and security of generated code.
 
 
 ## 🧩 Overview
@@ -32,6 +34,7 @@ vim ~/.bashrc
 # Add the following lines:
 # export OPENAI_API_KEY=<YOUR_API_KEY>
 # export GOOGLE_API_KEY=<YOUR_API_KEY>
+# export ANTHROPIC_API_KEY=<YOUR_API_KEY>  # required for --model claude-*
 source ~/.bashrc
 ```
 
@@ -105,6 +108,10 @@ Evaluates the functionality and security of generated backend service code acros
 BaxBench evaluation is integrated into `run_phase.sh` and runs automatically when `--task baxbench` is used.  
 It executes three stages sequentially: **extract** (parse generated code) → **test** (run functional tests) → **evaluate** (score security).
 
+> **Note:** BaxBench has its own dependencies (Docker SDK, etc.) on top of the main MACGen `requirements.txt` —
+> install them first with `pip install -r baxbench/requirements.txt` (Docker must also be running), otherwise
+> the evaluation stage above will fail partway through with a missing-module error.
+
 ```bash
 # End-to-end (generation + evaluation)
 bash run_phase.sh \
@@ -165,7 +172,7 @@ Outputs
 
 | Option        | Description |     
 |:--------------|:------------|                                                 
-| `--model`     | Model name (`gpt4o`,`gpt4o-mini`, `deepseek-r1_70b`, `gemini-2.5-flash`,`gemini-2.5-flash-lite`, `qwen3_8b`) |
+| `--model`     | Model name (`gpt4o`, `gpt4o-mini`, `gpt5.1`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `qwen3_8b`, `deepseek-r1_70b`, `claude-sonnet-5`) |
 | `--task`      | Task type (`llmseceval`, `cweval`, `humaneval`, `baxbench`)                  | 
 | `--pj-name`   | Project/experiment name     (auto: `<TASK>_<MODEL>_macgen` )     | 
 | `--cwe-limit` | Max number of CWE entries retrieved                              | 
@@ -237,8 +244,23 @@ Versions of the environment that produced the reported results (conda env `indic
 | `langchain-anthropic` | 0.3.22 |
 | `faiss-cpu` | 1.11.0 |
 
-`requirements.txt` will be synced to these exact versions before the camera-ready release.
-
 ---
 ## 📜 License
 Licensed under the [MIT License](LICENSE).
+
+
+## Citation
+
+If you use MACGen in your research, please cite:
+
+```bibtex
+@misc{yu2026macgenfunctionallycorrectsecure,
+      title={MACGen: Toward Functionally Correct and Secure Code Generation via Multi-Agent Collaboration}, 
+      author={Miseon Yu and Jaehoon Choi and Younghan Lee and Yunheung Paek},
+      year={2026},
+      eprint={2608.25457},
+      archivePrefix={arXiv},
+      primaryClass={cs.CR},
+      url={https://arxiv.org/abs/2608.25457}, 
+}
+```

@@ -163,7 +163,7 @@ def create_chat_model(
 
     # 4) OpenAI (default)
 
-    resolved = model_mapping[model_name]
+    resolved = model_mapping.get(model_name, model_name)
 
     # return ChatOpenAI(model=resolved, temperature=temperature, max_tokens=max_tokens)
     callback = TokenUsageCallback(model_name=model_name, agent_name=agent_name)

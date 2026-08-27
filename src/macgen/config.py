@@ -120,7 +120,9 @@ model_mapping = {
     "gpt4o": "gpt-4o",
     "gpt5": "gpt-5",
     "gpt5-mini": "gpt-5-mini",
-    "gpt5-nano": "gpt-5-nano", 
+    "gpt5-nano": "gpt-5-nano",
+    "gpt5.1": "gpt-5.1",
+    "gpt-5.1": "gpt-5.1",
     
     # Google Gemini
     "gemini-2.5-flash": "gemini-2.5-flash",
