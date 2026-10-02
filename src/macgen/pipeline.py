@@ -443,28 +443,28 @@ class MacgenEngine:
                 )
 
         extracted_clean: List[int] = []
-        for c, e in zip(cause_ids, effect_ids):
-            for x in (c, e):
-                if x.isdigit():
-                    extracted_clean.append(int(x))
-                elif ":" in x:
-                    success_extract = False
-                    parts = x.strip().split(":")
-                    for part in parts:
-                        part = part.strip()
-                        if part.isdigit():
-                            extracted_clean.append(int(part))
-                            success_extract = True
-                            break
-                        else:
-                            # logging.warning("Non-digit CWE ID found in split: %s", part)
-                            continue
-                    if not success_extract:
-                        logging.warning("No valid CWE ID found in split: %s", x)
-                        extracted_clean.append(0)
-                else:
-                    logging.warning("Non-digit CWE ID found: %s", x)
+        for x in cause_ids + effect_ids:
+            if x.isdigit():
+                extracted_clean.append(int(x))
+            elif ":" in x:
+                success_extract = False
+                parts = x.strip().split(":")
+                for part in parts:
+                    part = part.strip()
+                    if part.isdigit():
+                        extracted_clean.append(int(part))
+                        success_extract = True
+                        break
+                    else:
+                        # logging.warning("Non-digit CWE ID found in split: %s", part)
+                        continue
+                if not success_extract:
+                    logging.warning("No valid CWE ID found in split: %s", x)
                     extracted_clean.append(0)
+            else:
+                logging.warning("Non-digit CWE ID found: %s", x)
+                extracted_clean.append(0)
+        extracted_clean = list(dict.fromkeys(extracted_clean))  # dedupe, keep order
 
         meta: Dict[str, Dict[str, str]] = {}
         for cid in extracted_clean:
